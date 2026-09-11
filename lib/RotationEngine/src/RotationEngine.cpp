@@ -56,6 +56,13 @@ void RotationEngine::disable() {
     digitalWrite(_enablePin, _enableActiveHigh ? LOW : HIGH);
 }
 
+void RotationEngine::setMaxRpm(float rpm) {
+    _maxRpm = rpm;
+    for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
+        rotationPatternTable[i]->setMaxRpmCeiling(rpm);
+    }
+}
+
 void RotationEngine::setSpeedPercent(float percent) {
     percent = constrain(percent, 0.0f, 100.0f);
     _speedPercent = percent;
@@ -84,6 +91,30 @@ void RotationEngine::setPattern(uint8_t index) {
 char *RotationEngine::getPatternName(uint8_t index) {
     if (index >= rotationPatternTableSize) return (char *)"";
     return rotationPatternTable[index]->getName();
+}
+
+void RotationEngine::setSyncedStrokePosition(float rawPosition) {
+    float range = _strokePositionMax - _strokePositionMin;
+    float fraction = (range != 0.0f)
+        ? (rawPosition - _strokePositionMin) / range
+        : 0.0f;
+    if (_patternIndex < rotationPatternTableSize) {
+        rotationPatternTable[_patternIndex]->setStrokePosition(fraction); // pattern-side constrain()s to 0-1
+    }
+}
+
+void RotationEngine::setSyncedStrokeSpeed(float rawSpeed) {
+    float fraction = (_strokeSpeedReference != 0.0f) ? (rawSpeed / _strokeSpeedReference) : 0.0f;
+    if (_patternIndex < rotationPatternTableSize) {
+        rotationPatternTable[_patternIndex]->setStrokeSpeed(fraction); // pattern-side constrain()s to 0-1
+    }
+}
+
+void RotationEngine::setSyncedStrokeSensation(float rawSensation) {
+    float fraction = constrain(rawSensation / 100.0f, -1.0f, 1.0f);
+    if (_patternIndex < rotationPatternTableSize) {
+        rotationPatternTable[_patternIndex]->setStrokeSensation(fraction);
+    }
 }
 
 void RotationEngine::setScrewSyncInverted(bool inverted) {
@@ -130,10 +161,14 @@ void RotationEngine::_applyTarget(const rotationMotionParameter &target) {
         // else: too soon since the last actual reversal - hold current
         // direction this tick and re-check next tick. See
         // setMinReversalIntervalMs(). This is the backstop; the primary
-        // defense for a vibration-heavy stroke pattern is ScrewSync simply
-        // not requesting rapid reversals in the first place (see
+        // defense for a vibration-heavy stroke pattern is ScrewSync (and
+        // its variants: Stutter Sync, Bottom Hold Sync, Snap Reverse)
+        // simply not requesting rapid reversals in the first place (see
         // setStrokePatternSafeForSync() / update() below) - this floor
-        // exists in case anything else ever asks for fast reversals.
+        // exists in case anything else ever asks for fast reversals,
+        // including the self-contained patterns (Alternating Sweep,
+        // Random Direction Bursts, Metronome Flip, Drunken Walk,
+        // Escalating Reversal) if they're ever mistuned aggressively.
     }
 
     if (target.rpm < ROTATION_MIN_RUNNABLE_RPM) {
@@ -153,6 +188,12 @@ void RotationEngine::update() {
 
     rotationPatternTable[_patternIndex]->setStrokeDirection(_strokeExtending);
     rotationPatternTable[_patternIndex]->setStrokeSyncSafe(_syncSafetyOverrideEnabled ? _strokeSyncSafe : true);
+    // Position/speed forwarding happens in setSyncedStrokePosition()/
+    // setSyncedStrokeSpeed() at call time (driven by the telemetry
+    // callback's own cadence, not this tick), not here - see those methods
+    // above. Direction/sync-safety are re-pushed every tick because they're
+    // engine-held state the pattern needs refreshed each cycle; position/
+    // speed are event-driven from StrokeEngine instead.
     rotationMotionParameter target = rotationPatternTable[_patternIndex]->nextTarget(millis());
     _applyTarget(target);
 }
