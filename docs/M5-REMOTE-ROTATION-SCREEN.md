@@ -18,6 +18,11 @@ in this UI re-purposes the same 4 encoders + 3 buttons per screen - see the
 "how will the user control..." discussion for why that's the right model
 here rather than fighting Home for its encoders.
 
+**2026-09-11 update:** the rotation pattern roller (section 3c below) now
+lists all 17 rotation pattern names, not the original 5 - see
+`PATTERN-INTEGRATION-NOTES.md` section 1 for why this list must stay in
+sync with `RotationPattern.h`'s `rotationPatternTable[]` order.
+
 ## 1. `src/language.h` — two new strings
 
 ```cpp
@@ -310,7 +315,12 @@ void ui_Rotation_screen_init(void)
 
     ui_RotationPatternS = lv_roller_create(ui_Rotation);
     lv_roller_set_options(ui_RotationPatternS,
-                          "Steady\nSweep\nEscalation\nRandom Bursts\nScrew Sync",
+                          "Steady\nSweep\nEscalation\nRandom Bursts\nScrew Sync\n"
+                          "Stutter Sync\nBottom Hold Sync\nDepth Surge\n"
+                          "Threshold Burst\nTempo Match\nSnap Reverse\n"
+                          "Alternating Sweep\nRandom Direction Bursts\n"
+                          "Metronome Flip\nDrunken Walk\nEscalating Reversal\n"
+                          "Depth Trigger Spin",
                           LV_ROLLER_MODE_NORMAL);
 
     lv_obj_set_height(ui_RotationPatternS, 55);
@@ -837,5 +847,5 @@ gap, not something this session caused or fixes.
   (`"SimpleStroke\nTeasingPounding\n...Knot"`, 8 entries) don't match
   `StrokeEngine`'s actual 9-pattern table (ends in `JackHammer`/
   `StrokeNibbler`, not `Knot`) - a pre-existing drift, not something this
-  session touched or caused. Worth fixing at some point but out of scope
-  here; flagging since you're now in this file anyway.
+  session touched or caused. See `PATTERN-INTEGRATION-NOTES.md` section 6
+  for the corrected 10-entry stroke roller string (post Depth Pulse).
