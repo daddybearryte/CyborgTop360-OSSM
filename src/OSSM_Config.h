@@ -14,7 +14,7 @@
         Motion System Config
 */
 
-#define STEP_PER_REV      2000      // How many steps per revolution of the motor (S1 off, S2 on, S3 on, S4 off)
+#define STEP_PER_REV      4000      // Measured pulses/rev for this driver (did not match DIP table; trust measurement)
 #define PULLEY_TEETH      20        // How many teeth has the pulley
 #define BELT_PITCH        2         // What is the timing belt pitch in mm
 #define MAX_RPM           3500.0    // Maximum RPM of motor
@@ -35,6 +35,12 @@
 #define STROKE_RESULTION 5 // STROKE Resultion in mm per encoder Klick
 #define ENCODER_RESULTION 36 // Klicks per turn
 #define USER_SPEEDLIMIT 900 // Speed in Cycles (in & out) per minute.
+
+// --- Rotation axis config ---
+#define ROTATION_PULSES_PER_REV   1000    // PLACEHOLDER - verify by counting real revolutions
+#define ROTATION_MAX_RPM          200.0   // ceiling RPM at 100% speed - keep low for first spin
+#define ROTATION_INVERT_DIRECTION false   // flip if it spins backwards (direct drive is active-low)
+#define ROTATION_ENABLE_ACTIVE_HIGH true  // unused while ENA is unwired
 
 // The minimum value of the pot in percent
 // prevents noisy pots registering commands when turned down to zero by user

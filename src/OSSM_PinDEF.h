@@ -15,12 +15,19 @@
 // Enable Pin Motor Driver 
 #define SERVO_ENABLE      26     
 
+// --- Rotation axis (J9 header) ---
+// Direct drive, no ULN2803A: driver PLS+/DIR+ go to 3V3 (J6), PLS-/DIR- go to these pins.
+// Signals are active-low. ENA is left unwired. IO22 stays the stroke endstop.
+#define ROTATION_PULSE    2    // J9 IO2  -> driver PLS-  (strapping pin)
+#define ROTATION_DIR      15   // J9 IO15 -> driver DIR-  (strapping pin)
+#define ROTATION_ENABLE   33   // J9 IO33 -> unused (ENA not wired)
+
 #define SERVO_ALM_PIN        39        // Servo ALM Output
 #define SERVO_PED_PIN        36        // Servo PED Output
 /*
     Homing and safety pins
 */
-#define SERVO_ENDSTOP     12        // Homing Pin one Homing Switch IO pin to Ground 
+#define SERVO_ENDSTOP     22        // Homing Pin: TL-Q5MC1 (NPN-NO) sensor signal on J9 IO22 (moved from IO12)
 
 /*These are configured for the OSSM Remote - which has a screen, a potentiometer and an encoder which clicks*/
 #define SPEED_POT_PIN 34                // Speed Poti Pin
