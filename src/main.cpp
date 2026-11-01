@@ -7,6 +7,7 @@
 #include "OSSM_PinDEF.h"      // This is where you set pins specific for your board
 #include "FastLED.h"          // Used for the LED on the Reference Board (or any other pixel LEDS you may add)
 #include "RotaryEncoder.h"
+#include "RotationEngine.h"     // Rotation axis (lib/RotationEngine)
 #include "OssmUi.h"           // Separate file that helps contain the OLED screen functions for Local Remotes
 #include <esp_now.h>
 #include <WiFi.h>
@@ -50,6 +51,10 @@ const char* password = PASSWORD; // Add your password in arduino_secrets.h
 #define SETUP_D_I_F 13
 #define REBOOT 14
 #define OTA 15 // Need to Uncomment #define OTA_UPDATE if you want to use this command
+#define ROT_ON 30
+#define ROT_OFF 31
+#define ROT_SPEED 32
+#define ROT_PATTERN 33
 #define CONNECT 88
 #define HEARTBEAT 99
 
@@ -98,6 +103,8 @@ typedef struct struct_message {
   int esp_command;
   float esp_value;
   int esp_target;
+  float esp_rotation_speed;    // rotation speed state, 0-100%
+  float esp_rotation_pattern;  // rotation pattern index
 } struct_message;
 
 esp_now_peer_info_t peerInfo;
@@ -145,7 +152,7 @@ static motorProperties servoMotor {
   .maxSpeed = MAX_SPEED,                // Maximum speed the system can go in mm/s
   .maxAcceleration = MAX_ACCELERATION,  // Maximum linear acceleration in mm/s²
   .stepsPerMillimeter = STEP_PER_MM,    // Steps per millimeter 
-  .invertDirection = true,              // One of many ways to change the direction,  
+  .invertDirection = false,              // One of many ways to change the direction,  
                                         // should things move the wrong way
   .enableActiveLow = true,              // Polarity of the enable signal      
   .stepPin = SERVO_PULSE,               // Pin of the STEP signal
@@ -172,6 +179,9 @@ static sensorlessHomeProperties sensorless = {
 };
 
 StrokeEngine Stroker;
+RotationEngine Rotator(ROTATION_PULSE, ROTATION_DIR, ROTATION_ENABLE,
+                       ROTATION_INVERT_DIRECTION, ROTATION_ENABLE_ACTIVE_HIGH);
+TaskHandle_t rotation_T = nullptr;
 
 ///////////////////////////////////////////
 ////
@@ -226,6 +236,8 @@ void homingNotification(bool isHomed) {
       outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
       outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
       outgoingcontrol.esp_pattern = Stroker.getPattern();
+      outgoingcontrol.esp_rotation_speed = 0;
+      outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
       outgoingcontrol.esp_target = M5_ID;
       esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
       m5_paired = true;
@@ -357,6 +369,26 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               LogDebug(Stroker.getPatternName(patter));
               break;  
             }
+            case ROT_ON: {
+              LogDebug("ROT_ON Got");
+              Rotator.startPattern();
+              break;
+            }
+            case ROT_OFF: {
+              LogDebug("ROT_OFF Got");
+              Rotator.stopPattern();
+              break;
+            }
+            case ROT_SPEED: {
+              Rotator.setSpeedPercent(incomingcontrol.esp_value);
+              break;
+            }
+            case ROT_PATTERN: {
+              int rotPattern = incomingcontrol.esp_value;
+              Rotator.setPattern(rotPattern);
+              LogDebug(Rotator.getPatternName(rotPattern));
+              break;
+            }
             case TORQE_F: {
               int torqe = incomingcontrol.esp_value * 10;
               LogDebug(torqe);
@@ -413,6 +445,8 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
             outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
             outgoingcontrol.esp_pattern = Stroker.getPattern();
+            outgoingcontrol.esp_rotation_speed = 0;
+            outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
             outgoingcontrol.esp_target = M5_ID;
             esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
 
@@ -522,6 +556,9 @@ void setup() {
   Serial.printf("useSensorlessHoming: %s\n", hardwareVersion >= 20 ? "yes" : "no");
 
   Stroker.begin(&strokingMachine, &servoMotor); // Setup Stroke Engine
+  Rotator.begin();                              // J9 pins + LEDC, stays disabled
+  Rotator.setPulsesPerRev(ROTATION_PULSES_PER_REV);
+  Rotator.setMaxRpm(ROTATION_MAX_RPM);
   if (hardwareVersion >= 20)
   {
     Stroker.enableAndSensorlessHome(&sensorless, homingNotification, 10);
@@ -557,6 +594,15 @@ void setup() {
                             5,                  /* priority of the task */
                             &eRemote_t,         /* Task handle to keep track of created task */
                             0);                 /* pin task to core 0 */
+  delay(100);
+
+  xTaskCreatePinnedToCore(rotationEngineTask,    /* Task function. */
+                            "rotationEngineTask", /* name of task. */
+                            2048,                 /* Stack size of task */
+                            &Rotator,             /* parameter: engine instance */
+                            2,                    /* priority */
+                            &rotation_T,          /* Task handle */
+                            1);                   /* core 1 */
   delay(100);
   
 
