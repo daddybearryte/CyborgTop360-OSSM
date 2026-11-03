@@ -181,6 +181,21 @@ class RotationEngine {
         //! on it today.
         void setSyncedStrokeSensation(float rawSensation);
 
+        //! Overdrive on/off. When on, patterns' peaks can reach the
+        //! overdrive factor times the dial value (Depth Trigger Spin's burst
+        //! reaches factor x max). Off at boot. The dial itself never exceeds 100%.
+        void setOverdrive(bool enabled);
+        bool getOverdrive() { return _overdriveEnabled; }
+
+        //! Absolute ceiling multiplier (ROTATION_OVERDRIVE_FACTOR, 1.10).
+        //! Also the final clamp in _applyTarget(), whether overdrive is on or off.
+        void setOverdriveFactor(float factor) { _overdriveFactor = (factor < 1.0f) ? 1.0f : factor; _pushPeakScale(); }
+
+        //! Rotation Sensation from the remote, -100 to 100. Stored and
+        //! forwarded to every pattern. No pattern acts on it yet.
+        void setRotationSensation(float percent);
+        float getRotationSensationPercent() { return _rotationSensationPercent; }
+
         //! Reference speed that maps to a 1.0 fraction (i.e. "as fast as
         //! Tempo Match will ever ask the rotation axis to spin, driven by
         //! stroke speed alone"). This is a tunable feel parameter, not a
@@ -261,6 +276,10 @@ class RotationEngine {
         bool _strokeSyncSafe = true;   // last value fed via setStrokePatternSafeForSync()
         bool _syncSafetyOverrideEnabled = true;
         uint32_t _minReversalIntervalMs = 250;
+        bool _overdriveEnabled = false;
+        float _overdriveFactor = 1.10f;
+        float _rotationSensationPercent = 0.0f;
+        void _pushPeakScale();
 
         // Position/speed sync - raw values + normalization ranges. See the
         // class-level placeholder-range note at the top of this file.

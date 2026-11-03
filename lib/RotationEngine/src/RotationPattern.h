@@ -111,6 +111,17 @@ class RotationPattern {
         //! needs it gets selected later.
         virtual void setMaxRpmCeiling(float maxRpm) { _maxRpmCeiling = maxRpm; }
 
+        //! Overdrive peak scale pushed by RotationEngine: 1.0 when overdrive
+        //! is off, ROTATION_OVERDRIVE_FACTOR when on. Patterns that have a
+        //! "peak" (burst top, top of a speed walk, Depth Trigger Spin's burst)
+        //! multiply that peak by this. Everything below the peak stays
+        //! dial-relative.
+        virtual void setPeakScale(float scale) { _peakScale = (scale < 1.0f) ? 1.0f : scale; }
+
+        //! Rotation Sensation, -1.0 to 1.0, pushed by RotationEngine from the
+        //! remote's rotation Sensation dial. No pattern acts on it yet.
+        virtual void setRotationSensation(float fraction) { _rotationSensationFraction = constrain(fraction, -1.0f, 1.0f); }
+
         //! Fed by RotationEngine every tick from the stroke axis's telemetry
         //! (see main.cpp's strokeTelemetryCallback). Most patterns ignore
         //! this entirely - it exists for patterns like ScrewSync that
@@ -190,6 +201,8 @@ class RotationPattern {
         char _name[ROT_STRING_LEN];
         float _baseRpm = 0.0f;
         float _maxRpmCeiling = 0.0f;
+        float _peakScale = 1.0f;
+        float _rotationSensationFraction = 0.0f;
         bool _baseDirection = false;
         bool _strokeExtending = false;
         bool _strokeSyncSafe = true;
@@ -334,7 +347,7 @@ class RandomizedBursts : public RotationPattern {
                     : random(_restMinMs, _restMaxMs);
                 _nextEventMillis = nowMillis + window;
             }
-            _nextMove.rpm = _bursting ? _baseRpm : (_baseRpm * _restFraction);
+            _nextMove.rpm = _bursting ? (_baseRpm * _peakScale) : (_baseRpm * _restFraction);
             _nextMove.reverse = _baseDirection; // user's manual direction choice
             _nextMove.skip = false;
             return _nextMove;
@@ -811,7 +824,7 @@ class RandomDirectionBursts : public RotationPattern {
                     _reverse = !_reverse;
                 }
             }
-            _nextMove.rpm = _bursting ? _baseRpm : (_baseRpm * _restFraction);
+            _nextMove.rpm = _bursting ? (_baseRpm * _peakScale) : (_baseRpm * _restFraction);
             _nextMove.reverse = _reverse;
             _nextMove.skip = false;
             return _nextMove;
@@ -924,7 +937,11 @@ class DrunkenWalk : public RotationPattern {
                 _speedFraction = constrain(_speedFraction + step, _minFraction, 1.0f);
                 _nextSpeedStepMillis = nowMillis + _speedStepMs;
             }
-            _nextMove.rpm = _baseRpm * _speedFraction;
+            float peakBoost = 1.0f;
+            if (_speedFraction > 0.8f) {
+                peakBoost = 1.0f + (_peakScale - 1.0f) * ((_speedFraction - 0.8f) / 0.2f);
+            }
+            _nextMove.rpm = _baseRpm * _speedFraction * peakBoost;
             _nextMove.reverse = _reverse;
             _nextMove.skip = false;
             return _nextMove;
@@ -1160,7 +1177,7 @@ class DepthTriggerSpin : public RotationPattern {
                 }
             }
 
-            _nextMove.rpm = _bursting ? _maxRpmCeiling : _baseRpm;
+            _nextMove.rpm = _bursting ? (_maxRpmCeiling * _peakScale) : _baseRpm;
             _nextMove.reverse = _reverse;
             _nextMove.skip = false;
             return _nextMove;

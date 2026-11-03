@@ -117,6 +117,26 @@ void RotationEngine::setSyncedStrokeSensation(float rawSensation) {
     }
 }
 
+void RotationEngine::_pushPeakScale() {
+    float scale = _overdriveEnabled ? _overdriveFactor : 1.0f;
+    for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
+        rotationPatternTable[i]->setPeakScale(scale);
+    }
+}
+
+void RotationEngine::setOverdrive(bool enabled) {
+    _overdriveEnabled = enabled;
+    _pushPeakScale();
+}
+
+void RotationEngine::setRotationSensation(float percent) {
+    _rotationSensationPercent = constrain(percent, -100.0f, 100.0f);
+    float fraction = _rotationSensationPercent / 100.0f;
+    for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
+        rotationPatternTable[i]->setRotationSensation(fraction);
+    }
+}
+
 void RotationEngine::setScrewSyncInverted(bool inverted) {
     for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
         if (strcmp(rotationPatternTable[i]->getName(), "Screw Sync") == 0) {
@@ -171,12 +191,16 @@ void RotationEngine::_applyTarget(const rotationMotionParameter &target) {
         // Escalating Reversal) if they're ever mistuned aggressively.
     }
 
-    if (target.rpm < ROTATION_MIN_RUNNABLE_RPM) {
+    float rpm = target.rpm;
+    float rpmCeiling = _maxRpm * _overdriveFactor;   // absolute backstop, applies to every pattern
+    if (rpm > rpmCeiling) rpm = rpmCeiling;
+
+    if (rpm < ROTATION_MIN_RUNNABLE_RPM) {
         ledcWrite(_ledcChannel, 0);
         return;
     }
 
-    uint32_t hz = _rpmToHz(target.rpm);
+    uint32_t hz = _rpmToHz(rpm);
     uint32_t actualHz = ledcSetup(_ledcChannel, hz, _ledcResolutionBits);
     (void)actualHz; // available if you want to log the achieved-vs-requested frequency during bring-up
     ledcWrite(_ledcChannel, 1 << (_ledcResolutionBits - 1)); // ~50% duty - a symmetric pulse train

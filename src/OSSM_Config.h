@@ -37,10 +37,17 @@
 #define USER_SPEEDLIMIT 900 // Speed in Cycles (in & out) per minute.
 
 // --- Rotation axis config ---
-#define ROTATION_PULSES_PER_REV   1000    // PLACEHOLDER - verify by counting real revolutions
-#define ROTATION_MAX_RPM          200.0   // ceiling RPM at 100% speed - keep low for first spin
+#define ROTATION_PULSES_PER_REV   4000    // 400 pulses/rev DIP x ~10:1 reduction (measured)
+#define ROTATION_MAX_RPM          100.0   // raise once verified unloaded
+#define ROTATION_BURST_RPM        120.0   // absolute rotation burst ceiling in RPM at full dial; boot default, the remote Tweak screen changes it live
+#define ROTATION_OVERDRIVE_FACTOR (ROTATION_BURST_RPM / ROTATION_MAX_RPM)   // ceiling = MAX_RPM x this; patterns reach it only with Overdrive on
 #define ROTATION_INVERT_DIRECTION false   // flip if it spins backwards (direct drive is active-low)
 #define ROTATION_ENABLE_ACTIVE_HIGH true  // unused while ENA is unwired
+
+// Stroke Sensation response curve, applied where the remote's SENSATION command arrives.
+// 1.0 = linear (off). Below 1.0 the middle of the slider does more: at 0.6 a slider reading of 33 acts like about 51.
+// Not applied while Set Depth Fancy is active (there Sensation positions the carriage).
+#define STROKE_SENSATION_CURVE    0.6
 
 // The minimum value of the pot in percent
 // prevents noisy pots registering commands when turned down to zero by user

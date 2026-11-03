@@ -55,6 +55,13 @@ const char* password = PASSWORD; // Add your password in arduino_secrets.h
 #define ROT_OFF 31
 #define ROT_SPEED 32
 #define ROT_PATTERN 33
+#define ROT_DIR 34
+#define ROT_SENS 35
+#define ROT_OVERDRIVE 36
+#define COMBO 37
+#define TWEAK_BURST 38
+#define TWEAK_DIAL 39
+#define TWEAK_SPARE 40
 #define CONNECT 88
 #define HEARTBEAT 99
 
@@ -105,6 +112,13 @@ typedef struct struct_message {
   int esp_target;
   float esp_rotation_speed;    // rotation speed state, 0-100%
   float esp_rotation_pattern;  // rotation pattern index
+  float esp_rotation_direction; // 0.0 = forward, non-zero = reverse (must match remote)
+  float esp_rotation_sensation; // rotation sensation, -100 to 100
+  float esp_rotation_overdrive; // 0.0 = off, non-zero = on
+  float esp_combo;              // active combo index, -1 = none
+  float esp_tweak_burst;        // burst ceiling RPM (must match remote)
+  float esp_tweak_dial;         // dial max RPM (must match remote)
+  float esp_tweak_spare;        // reserved (must match remote)
 } struct_message;
 
 esp_now_peer_info_t peerInfo;
@@ -113,8 +127,17 @@ uint8_t defaultAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 bool m5_paired = false;
 bool m5_remotelost = false;
+bool rotationReverse = false;    // last manual direction from the remote (ROT_DIR)
+float rotationSpeedPct = 0.0f;   // last rotation speed from the remote (ROT_SPEED), echoed on reconnect
+float rotationSensationPct = 0.0f; // last rotation sensation from the remote (ROT_SENS)
+bool rotationOverdrive = false;  // overdrive state (ROT_OVERDRIVE), off at every boot
+int currentCombo = -1;           // last applied combo index, -1 after any manual pattern change
+float tweakBurstRpm = ROTATION_BURST_RPM;   // burst ceiling at full dial (TWEAK_BURST), boot default from OSSM_Config.h
+float tweakDialRpm = ROTATION_MAX_RPM;      // RPM that 100% on the rotation dial means (TWEAK_DIAL)
+float tweakSpare = 0.0f;                    // reserved (TWEAK_SPARE), no effect yet
+float rotationAppliedDialRpm = ROTATION_MAX_RPM;   // dial max currently applied to the engine
 
-#define HEARTBEAT_INTERVAL 10000/portTICK_PERIOD_MS	// 10 seconds
+#define HEARTBEAT_INTERVAL 3000/portTICK_PERIOD_MS	// 3 seconds (remote sends every 0.5 s); also the rotation failsafe timeout
 volatile TickType_t lastHeartbeatTime = 0;
 
 struct_message outgoingcontrol;
@@ -183,6 +206,89 @@ RotationEngine Rotator(ROTATION_PULSE, ROTATION_DIR, ROTATION_ENABLE,
                        ROTATION_INVERT_DIRECTION, ROTATION_ENABLE_ACTIVE_HIGH);
 TaskHandle_t rotation_T = nullptr;
 
+// ---- Rotation <-> stroke coupling -------------------------------------
+// Stroke patterns that reverse direction many times per second: unsafe to
+// mirror onto the rotation axis. Matched by name so a reordered table can't
+// silently break it.
+const char* vibrationHeavyStrokePatterns[] = { "Jack Hammer", "Stroke Nibbler", "Depth Pulse" };
+const unsigned int vibrationHeavyStrokePatternCount =
+    sizeof(vibrationHeavyStrokePatterns) / sizeof(vibrationHeavyStrokePatterns[0]);
+
+bool isVibrationHeavyStrokePattern(int patternIndex) {
+  String name = Stroker.getPatternName(patternIndex);
+  for (unsigned int i = 0; i < vibrationHeavyStrokePatternCount; i++) {
+    if (name == vibrationHeavyStrokePatterns[i]) return true;
+  }
+  return false;
+}
+
+// StrokeEngine supports a single telemetry callback; everything the rotation
+// axis needs from the stroke axis is fanned out from here.
+float lastStrokeTelemetryPosition = 0.0;
+bool haveLastStrokeTelemetryPosition = false;
+
+void strokeTelemetryCallback(float position, float speed, bool clipping) {
+  if (haveLastStrokeTelemetryPosition) {
+    Rotator.setSyncedStrokeDirection(position > lastStrokeTelemetryPosition);
+  }
+  Rotator.setSyncedStrokePosition(position);
+  Rotator.setSyncedStrokeSpeed(speed);
+  lastStrokeTelemetryPosition = position;
+  haveLastStrokeTelemetryPosition = true;
+}
+
+// ---- Combos -------------------------------------------------------------
+// Matched by pattern name so a reordered table can't silently break them.
+// Rotation speed is set once on apply; the rotation dial overrides it afterwards.
+struct ComboDef {
+  const char* name;
+  const char* strokePattern;
+  const char* rotationPattern;
+  float rotationSpeed;
+};
+
+const ComboDef comboTable[] = {
+  { "Locked in",   "Teasing or Pounding", "Screw Sync",              50.0f },
+  { "Layers",      "Deeper",              "Sweep",                   50.0f },
+  { "Depth aware", "Simple Stroke",       "Depth Surge",             50.0f },
+  { "Tempo aware", "Robo Stroke",         "Tempo Match",             50.0f },
+  { "Climax",      "Depth Pulse",         "Depth Trigger Spin",      50.0f },
+  { "Chaos",       "Insist",              "Random Direction Bursts", 50.0f }
+};
+const int comboCount = sizeof(comboTable) / sizeof(comboTable[0]);
+
+int findStrokePattern(const char* name) {
+  for (unsigned int i = 0; i < Stroker.getNumberOfPattern(); i++) {
+    if (Stroker.getPatternName(i) == name) return (int)i;
+  }
+  return -1;
+}
+
+int findRotationPattern(const char* name) {
+  for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
+    if (strcmp(Rotator.getPatternName(i), name) == 0) return (int)i;
+  }
+  return -1;
+}
+
+bool applyCombo(int index) {
+  if (index < 0 || index >= comboCount) return false;
+  int s = findStrokePattern(comboTable[index].strokePattern);
+  int r = findRotationPattern(comboTable[index].rotationPattern);
+  if (s < 0 || r < 0) {
+    Serial.println("Combo pattern name not found");
+    return false;
+  }
+  Stroker.setPattern(s, true);
+  Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(s));
+  Rotator.setPattern(r);
+  rotationSpeedPct = comboTable[index].rotationSpeed;
+  Rotator.setSpeedPercent(rotationSpeedPct);
+  currentCombo = index;
+  Serial.println(comboTable[index].name);
+  return true;
+}
+
 ///////////////////////////////////////////
 ////
 ////  To Debug or not to Debug
@@ -236,8 +342,10 @@ void homingNotification(bool isHomed) {
       outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
       outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
       outgoingcontrol.esp_pattern = Stroker.getPattern();
-      outgoingcontrol.esp_rotation_speed = 0;
+      outgoingcontrol.esp_rotation_speed = rotationSpeedPct; outgoingcontrol.esp_rotation_direction = rotationReverse ? 1.0f : 0.0f;
       outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
+      outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_overdrive = rotationOverdrive ? 1.0f : 0.0f; outgoingcontrol.esp_combo = (float)currentCombo;
+      outgoingcontrol.esp_tweak_burst = tweakBurstRpm; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_spare = tweakSpare;
       outgoingcontrol.esp_target = M5_ID;
       esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
       m5_paired = true;
@@ -247,6 +355,34 @@ void homingNotification(bool isHomed) {
     g_ui.UpdateMessage("Homing failed!");
     LogDebug("Homing failed!");
   }
+}
+
+// Apply the Tweak screen's burst ceiling and dial max to the rotation engine while it runs.
+// The engine thinks in a factor (ceiling = maxRpm x factor), so convert: factor = burst / dial.
+// The burst ceiling can never sit below the dial max (the engine also refuses a factor under 1.0).
+// Order matters so the clamp never overshoots for a tick: raising the dial lowers the factor first,
+// lowering the dial changes the dial first.
+void applyRotationTweak(){
+  float dial = tweakDialRpm;
+  float burst = (tweakBurstRpm < dial) ? dial : tweakBurstRpm;
+  float factor = burst / dial;
+  if (dial > rotationAppliedDialRpm) {
+    Rotator.setOverdriveFactor(factor);
+    Rotator.setMaxRpm(dial);
+  } else {
+    Rotator.setMaxRpm(dial);
+    Rotator.setOverdriveFactor(factor);
+  }
+  rotationAppliedDialRpm = dial;
+  Rotator.setSpeedPercent(rotationSpeedPct);   // setMaxRpm() does not refresh the active pattern's base speed
+}
+
+// Stroke sensation response curve (STROKE_SENSATION_CURVE in OSSM_Config.h). Keeps the sign, 0 and +/-100 map to themselves.
+float shapeStrokeSensation(float raw){
+  if (Stroker.getState() == SETUPDEPTH) return raw;   // Set Depth Fancy maps sensation to carriage position, keep it linear
+  float x = constrain(raw, -100.0f, 100.0f) / 100.0f;
+  float y = powf(fabsf(x), (float)STROKE_SENSATION_CURVE);
+  return (x < 0.0f ? -y : y) * 100.0f;
 }
 
 // Mobus for RS232
@@ -360,12 +496,16 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             }
             case SENSATION: {
               sensation = incomingcontrol.esp_value;
-              Stroker.setSensation(sensation, true);
+              float shapedSensation = shapeStrokeSensation(sensation);
+              Stroker.setSensation(shapedSensation, true);
+              Rotator.setSyncedStrokeSensation(shapedSensation);
               break;
             }
             case PATTERN: {
               int patter = incomingcontrol.esp_value;
               Stroker.setPattern(patter, true);
+              Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(patter));
+              currentCombo = -1;
               LogDebug(Stroker.getPatternName(patter));
               break;  
             }
@@ -380,13 +520,49 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               break;
             }
             case ROT_SPEED: {
+              rotationSpeedPct = incomingcontrol.esp_value;
               Rotator.setSpeedPercent(incomingcontrol.esp_value);
               break;
             }
             case ROT_PATTERN: {
               int rotPattern = incomingcontrol.esp_value;
               Rotator.setPattern(rotPattern);
+              currentCombo = -1;
               LogDebug(Rotator.getPatternName(rotPattern));
+              break;
+            }
+            case ROT_DIR: {
+              rotationReverse = (incomingcontrol.esp_value != 0.0);
+              Rotator.setBaseDirection(rotationReverse);
+              break;
+            }
+            case ROT_SENS: {
+              rotationSensationPct = incomingcontrol.esp_value;
+              Rotator.setRotationSensation(rotationSensationPct);
+              break;
+            }
+            case ROT_OVERDRIVE: {
+              rotationOverdrive = (incomingcontrol.esp_value != 0.0f);
+              Rotator.setOverdrive(rotationOverdrive);
+              break;
+            }
+            case COMBO: {
+              applyCombo((int)incomingcontrol.esp_value);
+              break;
+            }
+            case TWEAK_BURST: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v) && v >= 1.0f) { tweakBurstRpm = v; applyRotationTweak(); }
+              break;
+            }
+            case TWEAK_DIAL: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v) && v >= 1.0f) { tweakDialRpm = v; applyRotationTweak(); }
+              break;
+            }
+            case TWEAK_SPARE: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v)) { tweakSpare = v; }   // reserved, nothing reads it yet
               break;
             }
             case TORQE_F: {
@@ -445,8 +621,10 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
             outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
             outgoingcontrol.esp_pattern = Stroker.getPattern();
-            outgoingcontrol.esp_rotation_speed = 0;
+            outgoingcontrol.esp_rotation_speed = rotationSpeedPct; outgoingcontrol.esp_rotation_direction = rotationReverse ? 1.0f : 0.0f;
             outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
+      outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_overdrive = rotationOverdrive ? 1.0f : 0.0f; outgoingcontrol.esp_combo = (float)currentCombo;
+      outgoingcontrol.esp_tweak_burst = tweakBurstRpm; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_spare = tweakSpare;
             outgoingcontrol.esp_target = M5_ID;
             esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
 
@@ -559,6 +737,9 @@ void setup() {
   Rotator.begin();                              // J9 pins + LEDC, stays disabled
   Rotator.setPulsesPerRev(ROTATION_PULSES_PER_REV);
   Rotator.setMaxRpm(ROTATION_MAX_RPM);
+  Rotator.setOverdriveFactor(ROTATION_OVERDRIVE_FACTOR);
+  Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(Stroker.getPattern()));
+  Stroker.registerTelemetryCallback(strokeTelemetryCallback);
   if (hardwareVersion >= 20)
   {
     Stroker.enableAndSensorlessHome(&sensorless, homingNotification, 10);
@@ -641,6 +822,7 @@ void emergencyStopTask(void *pvParameters)
     if (m5_paired and (xTaskGetTickCount() - lastHeartbeatTime > HEARTBEAT_INTERVAL) and m5_remotelost == false) {
       Serial.println("Lost Remote");
       Stroker.stopMotion();
+      Rotator.stopPattern();   // failsafe: never leave the rotation axis spinning without a remote
       m5_remotelost = true;
 
       // Register back default peer
@@ -725,12 +907,12 @@ void CableRemoteTask(void *pvParameters)
 
           if (encoder->wasTurnedLeft()) {
           sensation = constrain((sensation - (200/ENCODER_RESULTION)), -100, 100);
-          Stroker.setSensation(sensation, false);
+          Stroker.setSensation(sensation, false); Rotator.setSyncedStrokeSensation(sensation);
           g_ui.UpdateStateR(map(sensation,-100,100,0,100));
           break;
           } else if (encoder->wasTurnedRight()) {
           sensation = constrain((sensation + (200/ENCODER_RESULTION)), -100, 100);
-          Stroker.setSensation(sensation, false);
+          Stroker.setSensation(sensation, false); Rotator.setSyncedStrokeSensation(sensation);
           g_ui.UpdateStateR(map(sensation,-100,100,0,100));
           break;
           }
