@@ -626,6 +626,11 @@ void StrokeEngine::registerTelemetryCallback(void(*callbackTelemetry)(float, flo
     _callbackTelemetry = callbackTelemetry;
 }
 
+float StrokeEngine::getCurrentPositionMm() {
+    if (servo == NULL || _motor == NULL) return 0.0f;
+    return (float)(servo->getCurrentPosition() / _motor->stepsPerMillimeter);
+}
+
 float StrokeEngine::_getAnalogAveragePercent(int pinNumber, int samples) {
     float sum = 0;
     float average = 0;

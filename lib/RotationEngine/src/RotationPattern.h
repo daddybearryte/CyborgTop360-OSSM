@@ -119,7 +119,10 @@ class RotationPattern {
         virtual void setPeakScale(float scale) { _peakScale = (scale < 1.0f) ? 1.0f : scale; }
 
         //! Rotation Sensation, -1.0 to 1.0, pushed by RotationEngine from the
-        //! remote's rotation Sensation dial. No pattern acts on it yet.
+        //! remote's rotation Sensation dial. Acts on: Screw Sync, Threshold Burst,
+        //! Alternating Sweep, Random Bursts, Metronome Flip, Depth Trigger Spin.
+        //! Convention: negative = faster / shorter / more frequent, positive =
+        //! slower / longer / less frequent, 0 = the pattern's default behavior.
         virtual void setRotationSensation(float fraction) { _rotationSensationFraction = constrain(fraction, -1.0f, 1.0f); }
 
         //! Fed by RotationEngine every tick from the stroke axis's telemetry
@@ -179,6 +182,14 @@ class RotationPattern {
         //! RotationEngine::setSyncedStrokeSensation().
         virtual void setStrokeSensation(float sensationFraction) { _strokeSensationFraction = constrain(sensationFraction, -1.0f, 1.0f); }
 
+        //! Fed by RotationEngine every tick when a live position provider is
+        //! registered (see RotationEngine::setLivePositionProvider()),
+        //! normalized 0.0-1.0 like setStrokePosition(), but from the stepper's
+        //! ACTUAL position instead of the commanded move targets. Only Depth
+        //! Trigger Spin reads it. Until the first call _haveLivePosition stays
+        //! false and that pattern falls back to its fixed burst window.
+        virtual void setStrokeLivePosition(float positionFraction) { _strokeLiveFraction = constrain(positionFraction, 0.0f, 1.0f); _haveLivePosition = true; }
+
         //! Called once when this pattern becomes the active pattern, so it
         //! can zero its own phase/timers instead of resuming mid-cycle from
         //! a previous activation.
@@ -203,6 +214,12 @@ class RotationPattern {
         float _maxRpmCeiling = 0.0f;
         float _peakScale = 1.0f;
         float _rotationSensationFraction = 0.0f;
+        float _strokeLiveFraction = 0.0f;
+        bool _haveLivePosition = false;
+
+        //! Rotation Sensation as a time/rate scale: 1.0 at 0, 0.25 at -1, 4.0 at +1.
+        //! Multiply a period by this: negative sensation = shorter period (faster).
+        float _sensScale() const { return powf(4.0f, _rotationSensationFraction); }
         bool _baseDirection = false;
         bool _strokeExtending = false;
         bool _strokeSyncSafe = true;
@@ -317,7 +334,20 @@ class RampingEscalation : public RotationPattern {
 /*!
   @brief  Randomized bursts of full base speed against a low resting
   speed, with randomized burst/rest durations pulled fresh each time a
-  window elapses. Direction stays constant.
+  window elapses. Some bursts also switch direction (merged in from the
+  old Random Direction Bursts): the roll happens once per burst-start, so
+  a single burst is always one consistent direction. The Reverse checkbox
+  only seeds the STARTING direction at reset(); the pattern owns direction
+  after that.
+
+  Rotation Sensation sets the gap (rest) length: 0 = the configured rest
+  windows, negative = shorter gaps (bursts come more often), positive =
+  longer gaps. Scale is 0.25x to 4x.
+
+  Reversal-rate note: worst case (every burst flips) is roughly one
+  reversal per burst+rest cycle. With the default windows (400-1500ms
+  burst, 800-3000ms rest) at the shortest gap scale (0.25x) that floors
+  around 600ms, above the engine's 250ms backstop.
 */
 /**************************************************************************/
 class RandomizedBursts : public RotationPattern {
@@ -333,22 +363,35 @@ class RandomizedBursts : public RotationPattern {
             _restFraction = restFraction;
         }
 
+        void setDirectionFlipChancePercent(uint8_t percent) { _flipChancePercent = min((uint8_t)100, percent); }
+
         void reset(unsigned long nowMillis) {
             _phaseStartMillis = nowMillis;
             _bursting = false;
             _nextEventMillis = 0; // forces a fresh random window on the next tick
+            _reverse = _baseDirection; // seed from manual choice; not re-read after this
         }
 
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
             if (nowMillis >= _nextEventMillis) {
                 _bursting = !_bursting;
-                unsigned long window = _bursting
-                    ? random(_burstMinMs, _burstMaxMs)
-                    : random(_restMinMs, _restMaxMs);
+                unsigned long window;
+                if (_bursting) {
+                    window = random(_burstMinMs, _burstMaxMs);
+                } else {
+                    float gapScale = _sensScale();
+                    unsigned long lo = (unsigned long)((float)_restMinMs * gapScale);
+                    unsigned long hi = (unsigned long)((float)_restMaxMs * gapScale);
+                    if (hi <= lo) hi = lo + 1;
+                    window = random(lo, hi);
+                }
                 _nextEventMillis = nowMillis + window;
+                if (_bursting && ((unsigned long)random(0, 100) < _flipChancePercent)) {
+                    _reverse = !_reverse;
+                }
             }
             _nextMove.rpm = _bursting ? (_baseRpm * _peakScale) : (_baseRpm * _restFraction);
-            _nextMove.reverse = _baseDirection; // user's manual direction choice
+            _nextMove.reverse = _reverse;
             _nextMove.skip = false;
             return _nextMove;
         }
@@ -359,6 +402,8 @@ class RandomizedBursts : public RotationPattern {
         unsigned long _burstMinMs = 400, _burstMaxMs = 1500;
         unsigned long _restMinMs = 800, _restMaxMs = 3000;
         float _restFraction = 0.25f;
+        uint8_t _flipChancePercent = 35;
+        bool _reverse = false;
 };
 
 /**************************************************************************/
@@ -397,25 +442,52 @@ class ScrewSync : public RotationPattern {
         //! thread, not the motor wiring.
         void setInverted(bool inverted) { _inverted = inverted; }
 
+        void reset(unsigned long nowMillis) {
+            _phaseStartMillis = nowMillis;
+            _haveLastExtending = false;
+            _reversalCount = 0;
+        }
+
+        //! Rotation Sensation sets how many stroke reversals pass between
+        //! direction flips. 0 = every reversal (1:1, the original Screw
+        //! Sync). Either way from 0 the delay grows: |sens| 1.0 = every 8th
+        //! reversal (Stutter Sync is every 2nd). Sign has no effect here.
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
             _nextMove.rpm = _baseRpm;
+            unsigned int everyNth = 1 + (unsigned int)(fabsf(_rotationSensationFraction) * 7.0f + 0.5f);
             if (_strokeSyncSafe) {
-                _nextMove.reverse = _inverted ? _strokeExtending : !_strokeExtending;
+                if (everyNth <= 1) {
+                    _committedReverse = _inverted ? _strokeExtending : !_strokeExtending;
+                } else if (_haveLastExtending && (_strokeExtending != _lastExtending)) {
+                    _reversalCount++;
+                    if (_reversalCount % everyNth == 0) {
+                        // Toggle rather than re-derive from the stroke phase: with an
+                        // even N the stroke phase is identical at every Nth reversal,
+                        // so re-deriving would never change direction.
+                        _committedReverse = !_committedReverse;
+                    }
+                }
+                _lastExtending = _strokeExtending;
+                _haveLastExtending = true;
             }
-            // else: leave _nextMove.reverse exactly as it was - hold the
-            // current direction rather than chase _strokeExtending. It's
-            // being toggled faster than is safe to mirror (a vibration-
-            // heavy stroke pattern is active, or safety was otherwise
-            // withheld - see RotationEngine::setStrokePatternSafeForSync()).
-            // This intentionally does NOT stop rotation, just freezes
-            // direction until a stroke pattern flagged safe is selected
-            // again.
+            // else: hold the current direction rather than chase
+            // _strokeExtending, and do not count reversals. It's being
+            // toggled faster than is safe to mirror (a vibration-heavy
+            // stroke pattern is active, or safety was otherwise withheld -
+            // see RotationEngine::setStrokePatternSafeForSync()). This
+            // intentionally does NOT stop rotation, just freezes direction
+            // until a stroke pattern flagged safe is selected again.
+            _nextMove.reverse = _committedReverse;
             _nextMove.skip = false;
             return _nextMove;
         }
 
     protected:
         bool _inverted = false;
+        bool _committedReverse = false;
+        bool _lastExtending = false;
+        bool _haveLastExtending = false;
+        unsigned int _reversalCount = 0;
 };
 
 /**************************************************************************/
@@ -591,7 +663,14 @@ class ThresholdBurst : public RotationPattern {
         }
 
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
-            bool pastThreshold = _strokePositionFraction >= _thresholdFraction;
+            // Rotation Sensation moves the threshold: negative = shallower
+            // (speeds up sooner), positive = deeper (only near full depth),
+            // 0 = the configured default.
+            float s = _rotationSensationFraction;
+            float threshold = (s < 0.0f)
+                ? _thresholdFraction + s * (_thresholdFraction - _thresholdMinFraction)
+                : _thresholdFraction + s * (_thresholdMaxFraction - _thresholdFraction);
+            bool pastThreshold = _strokePositionFraction >= threshold;
             _nextMove.rpm = _baseRpm * (pastThreshold ? 1.0f : _restFraction);
             _nextMove.reverse = _baseDirection;
             _nextMove.skip = false;
@@ -600,6 +679,8 @@ class ThresholdBurst : public RotationPattern {
 
     protected:
         float _thresholdFraction = 0.8f;
+        float _thresholdMinFraction = 0.3f;   // threshold at Rotation Sensation -1.0
+        float _thresholdMaxFraction = 0.98f;  // threshold at Rotation Sensation +1.0
         float _restFraction = 0.2f;
 };
 
@@ -752,7 +833,14 @@ class AlternatingSweep : public RotationPattern {
             unsigned long elapsed = nowMillis - _phaseStartMillis;
             unsigned long cycleIndex = elapsed / _periodMillis;
             if (cycleIndex != _lastCycleIndex) {
-                if (cycleIndex % _flipEveryN == 0) {
+                // Rotation Sensation scales the flip count: negative = fewer
+                // waves between flips (min every wave), positive = more (up
+                // to 4x), 0 = the configured count.
+                float s = _rotationSensationFraction;
+                float nScale = (s < 0.0f) ? (1.0f + 0.5f * s) : (1.0f + 3.0f * s);
+                unsigned long flipN = (unsigned long)((float)_flipEveryN * nScale + 0.5f);
+                if (flipN < 1) flipN = 1;
+                if (cycleIndex % flipN == 0) {
                     _reverse = !_reverse;
                 }
                 _lastCycleIndex = cycleIndex;
@@ -770,73 +858,6 @@ class AlternatingSweep : public RotationPattern {
         float _minFraction = 0.3f;
         uint8_t _flipEveryN = 2;
         unsigned long _lastCycleIndex = 0;
-        bool _reverse = false;
-};
-
-/**************************************************************************/
-/*!
-  @brief  Random Bursts' burst/rest timing, but each burst also rolls a
-  chance to flip direction when it starts - not just a speed change like
-  the original. The direction roll happens once per burst-start, not
-  every tick, so a single burst is always one consistent direction.
-  Self-contained - no stroke telemetry involved, no stroke-sync guard
-  needed (reversals are gated by this pattern's own random timer, same
-  independence as Alternating Sweep above).
-
-  Reversal-rate note: worst case (every burst flips) reverses roughly
-  once per burst+rest cycle - with the default windows (400-1500ms burst,
-  800-3000ms rest) that floors around ~1200ms, comfortably above the
-  engine's 250ms backstop. Shortening the burst/rest windows aggressively
-  narrows that margin - bench-check before pushing them much tighter.
-*/
-/**************************************************************************/
-class RandomDirectionBursts : public RotationPattern {
-    public:
-        RandomDirectionBursts(const char *str) : RotationPattern(str) {}
-
-        //! Same meaning as RandomizedBursts::setBurstParameters().
-        void setBurstParameters(unsigned long burstMinMs, unsigned long burstMaxMs,
-                                 unsigned long restMinMs, unsigned long restMaxMs,
-                                 float restFraction) {
-            _burstMinMs = burstMinMs; _burstMaxMs = burstMaxMs;
-            _restMinMs = restMinMs;   _restMaxMs = restMaxMs;
-            _restFraction = restFraction;
-        }
-
-        //! Chance (0-100) that a given burst also flips direction when it starts.
-        void setDirectionFlipChancePercent(uint8_t percent) { _flipChancePercent = min((uint8_t)100, percent); }
-
-        void reset(unsigned long nowMillis) {
-            _phaseStartMillis = nowMillis;
-            _bursting = false;
-            _nextEventMillis = 0;
-            _reverse = _baseDirection;
-        }
-
-        rotationMotionParameter nextTarget(unsigned long nowMillis) {
-            if (nowMillis >= _nextEventMillis) {
-                _bursting = !_bursting;
-                unsigned long window = _bursting
-                    ? random(_burstMinMs, _burstMaxMs)
-                    : random(_restMinMs, _restMaxMs);
-                _nextEventMillis = nowMillis + window;
-                if (_bursting && ((unsigned long)random(0, 100) < _flipChancePercent)) {
-                    _reverse = !_reverse;
-                }
-            }
-            _nextMove.rpm = _bursting ? (_baseRpm * _peakScale) : (_baseRpm * _restFraction);
-            _nextMove.reverse = _reverse;
-            _nextMove.skip = false;
-            return _nextMove;
-        }
-
-    protected:
-        bool _bursting = false;
-        unsigned long _nextEventMillis = 0;
-        unsigned long _burstMinMs = 400, _burstMaxMs = 1500;
-        unsigned long _restMinMs = 800, _restMaxMs = 3000;
-        float _restFraction = 0.25f;
-        uint8_t _flipChancePercent = 35;
         bool _reverse = false;
 };
 
@@ -871,7 +892,10 @@ class MetronomeFlip : public RotationPattern {
         }
 
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
-            if (nowMillis - _lastFlipMillis >= _intervalMillis) {
+            // Rotation Sensation scales the beat: negative = faster, positive
+            // = slower, 0 = the configured interval (0.25x to 4x).
+            unsigned long interval = (unsigned long)((float)_intervalMillis * _sensScale());
+            if (nowMillis - _lastFlipMillis >= interval) {
                 _reverse = !_reverse;
                 _lastFlipMillis = nowMillis;
             }
@@ -1131,10 +1155,16 @@ class DepthTriggerSpin : public RotationPattern {
         //! close to it.
         void setMinimumIntervalMs(unsigned long ms) { _minimumIntervalMs = ms; }
 
+        //! Live mode only: the burst ends when the stroke falls below this
+        //! fraction. Lower than the trigger so Depth Pulse's vibration at
+        //! full depth does not chop the burst.
+        void setExitThreshold(float thresholdFraction) { _exitThreshold = constrain(thresholdFraction, 0.0f, 1.0f); }
+
         void reset(unsigned long nowMillis) {
             _phaseStartMillis = nowMillis;
             _reverse = _baseDirection; // seed from manual choice; not re-read after this
             _bursting = false;
+            _latched = false;
             _windowEndMillis = 0;
             _nextFlipMillis = 0;
             _flipIntervalMs = 0;
@@ -1142,38 +1172,66 @@ class DepthTriggerSpin : public RotationPattern {
             _havePosition = false;
         }
 
+        //! Rotation Sensation scales the flip spacing during the burst:
+        //! negative = faster flips, positive = slower, 0 = the default
+        //! spacing (percentage of the stroke-Sensation window, 500ms floor).
+        //! It does not change the burst speed or the burst length.
+        //!
+        //! Two modes:
+        //!  - LIVE (a live stroke position is being fed): the burst starts
+        //!    when the stroke reaches full depth and holds, flipping
+        //!    direction, for as long as the stroke stays at depth, then
+        //!    drops back to the knob speed. A safety cap (1.5x the longest
+        //!    window) ends a burst if the stroke never leaves; the pattern
+        //!    then waits for the stroke to leave depth before re-arming.
+        //!  - FIXED WINDOW (no live position): the original behavior, a
+        //!    burst window sized by the stroke Sensation slider.
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
-            // Rising-edge trigger: fires the instant we cross the threshold
-            // from below, not on every tick spent above it.
-            bool crossedThreshold = _havePosition
-                && (_strokePositionFraction >= _triggerThreshold)
-                && (_lastPositionFraction < _triggerThreshold);
-            _lastPositionFraction = _strokePositionFraction;
-            _havePosition = true;
+            float spacingScale = _sensScale();
 
-            if (crossedThreshold && !_bursting) {
-                float windowSeconds = _minDurationSeconds
-                    + (_strokeSensationFraction + 1.0f) * 0.5f * (_maxDurationSeconds - _minDurationSeconds);
-                unsigned long windowMs = (unsigned long)(windowSeconds * 1000.0f);
-                unsigned long intervalMs = (unsigned long)((float)windowMs * (_reversalIntervalPercentage / 100.0f));
-                if (intervalMs < _minimumIntervalMs) intervalMs = _minimumIntervalMs;
-                _bursting = true;
-                _windowEndMillis = nowMillis + windowMs;
-                _flipIntervalMs = intervalMs;
-                _nextFlipMillis = nowMillis + intervalMs;
-            }
-
-            if (_bursting) {
-                if (nowMillis >= _windowEndMillis) {
-                    // Window's over - revert to simple knob-controlled
-                    // rotation. If this coincides exactly with a scheduled
-                    // flip, the window-close takes priority and that final
-                    // flip is skipped rather than happening right as it
-                    // reverts.
+            if (_haveLivePosition) {
+                bool atDepth = _bursting
+                    ? (_strokeLiveFraction >= _exitThreshold)
+                    : (_strokeLiveFraction >= _triggerThreshold);
+                if (!atDepth) {
                     _bursting = false;
-                } else if (nowMillis >= _nextFlipMillis) {
+                    _latched = false;   // left full depth: re-arm
+                } else if (!_bursting && !_latched) {
+                    _bursting = true;
+                    _windowEndMillis = nowMillis + (unsigned long)(_maxDurationSeconds * 1500.0f);
+                    _flipIntervalMs = _flipSpacingMs(_windowMs(), spacingScale);
+                    _nextFlipMillis = nowMillis + _flipIntervalMs;
+                }
+                if (_bursting && nowMillis >= _windowEndMillis) {
+                    _bursting = false;
+                    _latched = true;    // safety cap hit: wait for the stroke to leave depth
+                }
+                if (_bursting && nowMillis >= _nextFlipMillis) {
                     _reverse = !_reverse;
-                    _nextFlipMillis += _flipIntervalMs; // scheduled off the last flip, not "now" - avoids drift
+                    _flipIntervalMs = _flipSpacingMs(_windowMs(), spacingScale);
+                    _nextFlipMillis += _flipIntervalMs;
+                }
+            } else {
+                bool crossedThreshold = _havePosition
+                    && (_strokePositionFraction >= _triggerThreshold)
+                    && (_lastPositionFraction < _triggerThreshold);
+                _lastPositionFraction = _strokePositionFraction;
+                _havePosition = true;
+
+                if (crossedThreshold && !_bursting) {
+                    unsigned long windowMs = _windowMs();
+                    _bursting = true;
+                    _windowEndMillis = nowMillis + windowMs;
+                    _flipIntervalMs = _flipSpacingMs(windowMs, spacingScale);
+                    _nextFlipMillis = nowMillis + _flipIntervalMs;
+                }
+                if (_bursting) {
+                    if (nowMillis >= _windowEndMillis) {
+                        _bursting = false;
+                    } else if (nowMillis >= _nextFlipMillis) {
+                        _reverse = !_reverse;
+                        _nextFlipMillis += _flipIntervalMs; // scheduled off the last flip, not "now" - avoids drift
+                    }
                 }
             }
 
@@ -1184,7 +1242,19 @@ class DepthTriggerSpin : public RotationPattern {
         }
 
     protected:
+        unsigned long _windowMs() const {
+            float windowSeconds = _minDurationSeconds
+                + (_strokeSensationFraction + 1.0f) * 0.5f * (_maxDurationSeconds - _minDurationSeconds);
+            return (unsigned long)(windowSeconds * 1000.0f);
+        }
+        unsigned long _flipSpacingMs(unsigned long windowMs, float scale) const {
+            unsigned long ms = (unsigned long)((float)windowMs * (_reversalIntervalPercentage / 100.0f) * scale);
+            return (ms < _minimumIntervalMs) ? _minimumIntervalMs : ms;
+        }
+
         float _triggerThreshold = 0.95f;
+        float _exitThreshold = 0.75f;
+        bool _latched = false;
         float _minDurationSeconds = 1.0f;
         float _maxDurationSeconds = 30.0f;
         float _reversalIntervalPercentage = 50.0f;
@@ -1206,7 +1276,7 @@ class DepthTriggerSpin : public RotationPattern {
 
   ORDER IS LOAD-BEARING - see PATTERN-INTEGRATION-NOTES.md "cross-file
   sync": the M5 remote's ui_RotationPatternS roller option string must
-  list these same 17 names in this same order, or the selector and the
+  list these same 16 names in this same order, or the selector and the
   firmware disagree about which index means which pattern.
 */
 /**************************************************************************/
@@ -1223,7 +1293,6 @@ static RotationPattern *rotationPatternTable[] = {
   new TempoMatch("Tempo Match"),
   new SnapReverse("Snap Reverse"),
   new AlternatingSweep("Alternating Sweep"),
-  new RandomDirectionBursts("Random Direction Bursts"),
   new MetronomeFlip("Metronome Flip"),
   new DrunkenWalk("Drunken Walk"),
   new EscalatingReversal("Escalating Reversal"),

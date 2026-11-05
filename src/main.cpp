@@ -62,6 +62,7 @@ const char* password = PASSWORD; // Add your password in arduino_secrets.h
 #define TWEAK_BURST 38
 #define TWEAK_DIAL 39
 #define TWEAK_SPARE 40
+#define RETRACT 41
 #define CONNECT 88
 #define HEARTBEAT 99
 
@@ -227,6 +228,12 @@ bool isVibrationHeavyStrokePattern(int patternIndex) {
 float lastStrokeTelemetryPosition = 0.0;
 bool haveLastStrokeTelemetryPosition = false;
 
+// Actual stepper position for Depth Trigger Spin's hold-while-at-depth mode.
+// RotationEngine polls this every tick (see setLivePositionProvider()).
+float strokeLivePositionMm() {
+  return Stroker.getCurrentPositionMm();
+}
+
 void strokeTelemetryCallback(float position, float speed, bool clipping) {
   if (haveLastStrokeTelemetryPosition) {
     Rotator.setSyncedStrokeDirection(position > lastStrokeTelemetryPosition);
@@ -248,12 +255,13 @@ struct ComboDef {
 };
 
 const ComboDef comboTable[] = {
-  { "Locked in",   "Teasing or Pounding", "Screw Sync",              50.0f },
-  { "Layers",      "Deeper",              "Sweep",                   50.0f },
-  { "Depth aware", "Simple Stroke",       "Depth Surge",             50.0f },
-  { "Tempo aware", "Robo Stroke",         "Tempo Match",             50.0f },
-  { "Climax",      "Depth Pulse",         "Depth Trigger Spin",      50.0f },
-  { "Chaos",       "Insist",              "Random Direction Bursts", 50.0f }
+  { "Locked in",   "Teasing or Pounding", "Screw Sync",         50.0f },
+  { "Layers",      "Deeper",              "Alternating Sweep",  50.0f },
+  { "Depth aware", "Simple Stroke",       "Depth Surge",        50.0f },
+  { "Tempo aware", "Half'n'Half",         "Tempo Match",        50.0f },
+  { "Climax",      "Depth Pulse",         "Depth Trigger Spin", 50.0f },
+  { "Chaos",       "Insist",              "Random Bursts",      50.0f },
+  { "Climb",       "Deeper",              "Threshold Burst",    50.0f }
 };
 const int comboCount = sizeof(comboTable) / sizeof(comboTable[0]);
 
@@ -438,7 +446,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
       Serial.printf("M5 remote connected! Restarting homing\n");
       Stroker.disable();
 
-      if (hardwareVersion >= 20){
+      if (USE_SENSORLESS_HOMING){
         Stroker.enableAndSensorlessHome(&sensorless, homingNotification, 10);
       }
       else{
@@ -477,6 +485,11 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               Stroker.stopMotion();
               outgoingcontrol.esp_command = OFF;
               esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
+              break;
+            }
+            case RETRACT: {
+              LogDebug("RETRACT Got");
+              Stroker.moveToMin(10);   // stops the stroke axis, then back to depth 0 at 10 mm/s
               break;
             }
             case SPEED: {
@@ -731,16 +744,19 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db); // allows us to read almost full 3.3V range
 
-  Serial.printf("useSensorlessHoming: %s\n", hardwareVersion >= 20 ? "yes" : "no");
+  Serial.printf("useSensorlessHoming: %s (EEPROM hw version %d ignored)\n", USE_SENSORLESS_HOMING ? "yes" : "no", hardwareVersion);
 
   Stroker.begin(&strokingMachine, &servoMotor); // Setup Stroke Engine
   Rotator.begin();                              // J9 pins + LEDC, stays disabled
   Rotator.setPulsesPerRev(ROTATION_PULSES_PER_REV);
   Rotator.setMaxRpm(ROTATION_MAX_RPM);
+  Rotator.setLivePositionProvider(strokeLivePositionMm);
   Rotator.setOverdriveFactor(ROTATION_OVERDRIVE_FACTOR);
+  Rotator.setMaxAccelRpmPerSec(ROTATION_MAX_ACCEL_RPM_PER_S);
+  Rotator.setReversalSafeRpm(ROTATION_REVERSAL_SAFE_RPM);
   Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(Stroker.getPattern()));
   Stroker.registerTelemetryCallback(strokeTelemetryCallback);
-  if (hardwareVersion >= 20)
+  if (USE_SENSORLESS_HOMING)
   {
     Stroker.enableAndSensorlessHome(&sensorless, homingNotification, 10);
   }

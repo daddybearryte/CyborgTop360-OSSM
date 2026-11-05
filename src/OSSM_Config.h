@@ -5,6 +5,10 @@
 #define EEPROM_SIZE 200
 #define HW_VERSION 22 //divide by 10 for real hw version
 
+// Homing mode. false = endstop switch on SERVO_ENDSTOP (IO22), homes toward the rear. true = sensorless (current sense), drives toward the FRONT stop first.
+// Fixed here on purpose: the stored EEPROM hardware version no longer selects the homing mode.
+#define USE_SENSORLESS_HOMING false
+
 //#define INITIAL_SETUP //should only be defined at initial burn to configure HW version
 
 #define OSSM_ID  1 //OSSM_ID Default can be changed with M5 Remote in the Future will be Saved in EPROOM
@@ -41,6 +45,8 @@
 #define ROTATION_MAX_RPM          100.0   // raise once verified unloaded
 #define ROTATION_BURST_RPM        120.0   // absolute rotation burst ceiling in RPM at full dial; boot default, the remote Tweak screen changes it live
 #define ROTATION_OVERDRIVE_FACTOR (ROTATION_BURST_RPM / ROTATION_MAX_RPM)   // ceiling = MAX_RPM x this; patterns reach it only with Overdrive on
+#define ROTATION_MAX_ACCEL_RPM_PER_S 300.0   // output slew limit in RPM per second, 0 = off. Lower it if the driver still faults.
+#define ROTATION_REVERSAL_SAFE_RPM   20.0    // direction flips only at or below this RPM; the axis slows to it first
 #define ROTATION_INVERT_DIRECTION false   // flip if it spins backwards (direct drive is active-low)
 #define ROTATION_ENABLE_ACTIVE_HIGH true  // unused while ENA is unwired
 

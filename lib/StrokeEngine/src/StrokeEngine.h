@@ -390,6 +390,14 @@ class StrokeEngine {
         /**************************************************************************/
         void registerTelemetryCallback(void(*callbackTelemetry)(float, float, bool));
 
+        /**************************************************************************/
+        /*!
+          @brief  The stepper's actual current position in mm (not a commanded
+          target). Safe to poll; returns 0.0 before begin().
+        */
+        /**************************************************************************/
+        float getCurrentPositionMm();
+
     protected:
         ServoState _state = UNDEFINED;
         motorProperties *_motor;

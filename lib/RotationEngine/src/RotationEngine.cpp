@@ -52,6 +52,8 @@ void RotationEngine::enable() {
 
 void RotationEngine::disable() {
     _running = false;
+    _currentRpm = 0.0f;
+    _lastHz = 0;
     ledcWrite(_ledcChannel, 0);
     digitalWrite(_enablePin, _enableActiveHigh ? LOW : HIGH);
 }
@@ -100,6 +102,16 @@ void RotationEngine::setSyncedStrokePosition(float rawPosition) {
         : 0.0f;
     if (_patternIndex < rotationPatternTableSize) {
         rotationPatternTable[_patternIndex]->setStrokePosition(fraction); // pattern-side constrain()s to 0-1
+    }
+}
+
+void RotationEngine::setSyncedStrokeLivePosition(float rawPosition) {
+    float range = _strokePositionMax - _strokePositionMin;
+    float fraction = (range != 0.0f)
+        ? (rawPosition - _strokePositionMin) / range
+        : 0.0f;
+    if (_patternIndex < rotationPatternTableSize) {
+        rotationPatternTable[_patternIndex]->setStrokeLivePosition(fraction); // pattern-side constrain()s to 0-1
     }
 }
 
@@ -152,11 +164,16 @@ void RotationEngine::setScrewSyncInverted(bool inverted) {
 void RotationEngine::startPattern() {
     rotationPatternTable[_patternIndex]->reset(millis());
     enable();
+    _currentRpm = 0.0f;
+    _lastApplyMillis = millis();
+    _lastHz = 0;
     _running = true;
 }
 
 void RotationEngine::stopPattern() {
     _running = false;
+    _currentRpm = 0.0f;
+    _lastHz = 0;
     ledcWrite(_ledcChannel, 0);
 }
 
@@ -168,41 +185,49 @@ uint32_t RotationEngine::_rpmToHz(float rpm) {
 void RotationEngine::_applyTarget(const rotationMotionParameter &target) {
     if (target.skip) return; // pattern says: hold last output, nothing to do
 
-    // Direction is a static level - only touch the pin on an actual change
-    // to avoid needless writes every 30ms tick.
-    bool wantReverse = target.reverse != _invertDirection; // XOR against wiring inversion
-    if (wantReverse != _lastDirWritten) {
-        unsigned long now = millis();
-        if (now - _lastDirChangeMillis >= _minReversalIntervalMs) {
-            digitalWrite(_dirPin, wantReverse ? HIGH : LOW);
-            _lastDirWritten = wantReverse;
-            _lastDirChangeMillis = now;
-        }
-        // else: too soon since the last actual reversal - hold current
-        // direction this tick and re-check next tick. See
-        // setMinReversalIntervalMs(). This is the backstop; the primary
-        // defense for a vibration-heavy stroke pattern is ScrewSync (and
-        // its variants: Stutter Sync, Bottom Hold Sync, Snap Reverse)
-        // simply not requesting rapid reversals in the first place (see
-        // setStrokePatternSafeForSync() / update() below) - this floor
-        // exists in case anything else ever asks for fast reversals,
-        // including the self-contained patterns (Alternating Sweep,
-        // Random Direction Bursts, Metronome Flip, Drunken Walk,
-        // Escalating Reversal) if they're ever mistuned aggressively.
-    }
-
+    unsigned long now = millis();
     float rpm = target.rpm;
     float rpmCeiling = _maxRpm * _overdriveFactor;   // absolute backstop, applies to every pattern
     if (rpm > rpmCeiling) rpm = rpmCeiling;
 
+    // Direction is a static level. A reversal is only carried out once the
+    // output has slowed to _reversalSafeRpm: until then the target is capped
+    // at that speed, so the axis decelerates, flips, then ramps back up.
+    // The min-interval floor still applies as the backstop on reversal rate.
+    bool wantReverse = target.reverse != _invertDirection; // XOR against wiring inversion
+    if (wantReverse != _lastDirWritten && (now - _lastDirChangeMillis >= _minReversalIntervalMs)) {
+        if (_currentRpm <= _reversalSafeRpm + 0.01f) {
+            digitalWrite(_dirPin, wantReverse ? HIGH : LOW);
+            _lastDirWritten = wantReverse;
+            _lastDirChangeMillis = now;
+        } else if (rpm > _reversalSafeRpm) {
+            rpm = _reversalSafeRpm;   // slow down first, flip on a later tick
+        }
+    }
+
+    // Slew limit toward the (possibly capped) target.
+    unsigned long dtMs = now - _lastApplyMillis;
+    _lastApplyMillis = now;
+    if (dtMs > 100) dtMs = 100;   // after a pause, don't allow one huge jump
+    if (_maxAccelRpmPerSec > 0.0f) {
+        float step = _maxAccelRpmPerSec * ((float)dtMs / 1000.0f);
+        if (rpm > _currentRpm + step) rpm = _currentRpm + step;
+        else if (rpm < _currentRpm - step) rpm = _currentRpm - step;
+    }
+    _currentRpm = rpm;
+
     if (rpm < ROTATION_MIN_RUNNABLE_RPM) {
         ledcWrite(_ledcChannel, 0);
+        _lastHz = 0;
         return;
     }
 
     uint32_t hz = _rpmToHz(rpm);
-    uint32_t actualHz = ledcSetup(_ledcChannel, hz, _ledcResolutionBits);
-    (void)actualHz; // available if you want to log the achieved-vs-requested frequency during bring-up
+    if (hz != _lastHz) {
+        uint32_t actualHz = ledcSetup(_ledcChannel, hz, _ledcResolutionBits);
+        (void)actualHz; // available if you want to log the achieved-vs-requested frequency during bring-up
+        _lastHz = hz;
+    }
     ledcWrite(_ledcChannel, 1 << (_ledcResolutionBits - 1)); // ~50% duty - a symmetric pulse train
 }
 
@@ -212,6 +237,9 @@ void RotationEngine::update() {
 
     rotationPatternTable[_patternIndex]->setStrokeDirection(_strokeExtending);
     rotationPatternTable[_patternIndex]->setStrokeSyncSafe(_syncSafetyOverrideEnabled ? _strokeSyncSafe : true);
+    if (_livePositionProvider != NULL) {
+        setSyncedStrokeLivePosition(_livePositionProvider());   // actual stepper position, polled each tick
+    }
     // Position/speed forwarding happens in setSyncedStrokePosition()/
     // setSyncedStrokeSpeed() at call time (driven by the telemetry
     // callback's own cadence, not this tick), not here - see those methods

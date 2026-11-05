@@ -155,6 +155,17 @@ class RotationEngine {
         //! Threshold Burst act on it; cheap to call regardless.
         void setSyncedStrokePosition(float rawPosition);
 
+        //! Feed the stroke axis's ACTUAL (live) position in, same raw units and
+        //! same range normalization as setSyncedStrokePosition(), forwarded to
+        //! the active pattern as setStrokeLivePosition(). Only Depth Trigger
+        //! Spin uses it. update() calls this every tick when a provider is
+        //! registered below.
+        void setSyncedStrokeLivePosition(float rawPosition);
+
+        //! Register a function returning the stroke axis's current raw position
+        //! (mm). Optional: without one, Depth Trigger Spin keeps its fixed burst window.
+        void setLivePositionProvider(float (*provider)()) { _livePositionProvider = provider; }
+
         //! Configure the raw-position range that maps to the pattern-facing
         //! 0-1 fraction: minPosition -> 0.0 (fully retracted), maxPosition
         //! -> 1.0 (full depth). MUST match Stroker's actual configured
@@ -237,6 +248,17 @@ class RotationEngine {
         //! interval.
         void setMinReversalIntervalMs(uint32_t ms) { _minReversalIntervalMs = ms; }
 
+        //! Speed ramp. The output RPM moves toward the pattern's target by at
+        //! most this many RPM per second, in both directions (0 = no limit).
+        //! Stops a step to burst speed from stalling the motor.
+        void setMaxAccelRpmPerSec(float rpmPerSec) { _maxAccelRpmPerSec = (rpmPerSec < 0.0f) ? 0.0f : rpmPerSec; }
+
+        //! Reversal ramp. A direction change is held until the output has
+        //! slowed to this RPM or below: the engine decelerates to it, flips
+        //! DIR, then ramps back up. Reversing at full speed is what trips
+        //! the driver. 0 = only reverse from standstill.
+        void setReversalSafeRpm(float rpm) { _reversalSafeRpm = (rpm < 0.0f) ? 0.0f : rpm; }
+
         //! Passthrough to ScrewSync::setInverted() (rotationPatternTable[4]).
         //! Flip once at bring-up if "screw in" turns out to unscrew instead -
         //! see MAINBOARD-ROTATION-INTEGRATION.md section 4c. A no-op if
@@ -277,12 +299,18 @@ class RotationEngine {
         bool _syncSafetyOverrideEnabled = true;
         uint32_t _minReversalIntervalMs = 250;
         bool _overdriveEnabled = false;
+        float _maxAccelRpmPerSec = 300.0f;   // output slew limit, see setMaxAccelRpmPerSec()
+        float _reversalSafeRpm = 20.0f;      // flip DIR only at or below this, see setReversalSafeRpm()
+        float _currentRpm = 0.0f;            // RPM actually being output right now
+        unsigned long _lastApplyMillis = 0;
+        uint32_t _lastHz = 0;                // last LEDC frequency set, skip ledcSetup() when unchanged
         float _overdriveFactor = 1.10f;
         float _rotationSensationPercent = 0.0f;
         void _pushPeakScale();
 
         // Position/speed sync - raw values + normalization ranges. See the
         // class-level placeholder-range note at the top of this file.
+        float (*_livePositionProvider)() = NULL;
         float _strokePositionMin = 0.0f;
         float _strokePositionMax = 150.0f;   // PLACEHOLDER - confirm against Stroker's actual travel (mm assumed)
         float _strokeSpeedReference = 100.0f; // PLACEHOLDER - tunable feel parameter, not measured
