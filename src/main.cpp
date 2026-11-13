@@ -238,6 +238,15 @@ void strokeTelemetryCallback(float position, float speed, bool clipping) {
   if (haveLastStrokeTelemetryPosition) {
     Rotator.setSyncedStrokeDirection(position > lastStrokeTelemetryPosition);
   }
+  // Depth-linked rotation patterns (Depth Surge, Threshold Burst, Depth Trigger Spin) need position as a
+  // fraction of the travel the stroke actually uses, not of the machine's full 150 mm: with Depth at 80 mm a
+  // fixed 0-150 scale never gets past 0.53 and their thresholds never fire. Re-derive the window from the
+  // commanded Depth and Stroke on every move, so it follows any change from any remote.
+  float windowTop = Stroker.getDepth();
+  float windowBottom = windowTop - Stroker.getStroke();
+  if (windowBottom < 0.0f) windowBottom = 0.0f;
+  if (windowTop < windowBottom + 1.0f) windowTop = windowBottom + 1.0f;   // never a zero-width window
+  Rotator.setStrokePositionRange(windowBottom, windowTop);
   Rotator.setSyncedStrokePosition(position);
   Rotator.setSyncedStrokeSpeed(speed);
   lastStrokeTelemetryPosition = position;
