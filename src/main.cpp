@@ -1,5 +1,6 @@
 #include <Arduino.h>          // Basic Needs
 #include <EEPROM.h>
+#include <Preferences.h>      // Saved Reverse (axis invert) setting
 #include <Wire.h>
 #include <SPI.h>
 #include <StrokeEngine.h>     // Include Stroke Engine
@@ -57,11 +58,11 @@ const char* password = PASSWORD; // Add your password in arduino_secrets.h
 #define ROT_PATTERN 33
 #define ROT_DIR 34
 #define ROT_SENS 35
-#define ROT_OVERDRIVE 36
+#define ROT_BURST 36        // rotation burst speed, percent of the dial cap (was ROT_OVERDRIVE)
 #define COMBO 37
-#define TWEAK_BURST 38
-#define TWEAK_DIAL 39
-#define TWEAK_SPARE 40
+// 38 retired (was TWEAK_BURST). Left unused so old and new remotes never collide on it.
+#define TWEAK_DIAL 39       // rotation dial cap in RPM, hard ceiling
+#define TWEAK_REVERSE 40    // flip the whole rotation axis direction (was TWEAK_SPARE)
 #define RETRACT 41
 #define CONNECT 88
 #define HEARTBEAT 99
@@ -115,11 +116,11 @@ typedef struct struct_message {
   float esp_rotation_pattern;  // rotation pattern index
   float esp_rotation_direction; // 0.0 = forward, non-zero = reverse (must match remote)
   float esp_rotation_sensation; // rotation sensation, -100 to 100
-  float esp_rotation_overdrive; // 0.0 = off, non-zero = on
+  float esp_rotation_burst;     // rotation burst speed, percent of the dial cap (must match remote)
   float esp_combo;              // active combo index, -1 = none
-  float esp_tweak_burst;        // burst ceiling RPM (must match remote)
-  float esp_tweak_dial;         // dial max RPM (must match remote)
-  float esp_tweak_spare;        // reserved (must match remote)
+  float esp_tweak_burst;        // retired, always 0 (keeps the struct layout identical on both sides)
+  float esp_tweak_dial;         // dial cap RPM (must match remote)
+  float esp_tweak_reverse;      // 0.0 = as configured, non-zero = axis direction flipped (must match remote)
 } struct_message;
 
 esp_now_peer_info_t peerInfo;
@@ -131,12 +132,11 @@ bool m5_remotelost = false;
 bool rotationReverse = false;    // last manual direction from the remote (ROT_DIR)
 float rotationSpeedPct = 0.0f;   // last rotation speed from the remote (ROT_SPEED), echoed on reconnect
 float rotationSensationPct = 0.0f; // last rotation sensation from the remote (ROT_SENS)
-bool rotationOverdrive = false;  // overdrive state (ROT_OVERDRIVE), off at every boot
+float rotationBurstPct = ROTATION_BURST_PERCENT;  // rotation burst speed, percent of the dial cap (ROT_BURST)
 int currentCombo = -1;           // last applied combo index, -1 after any manual pattern change
-float tweakBurstRpm = ROTATION_BURST_RPM;   // burst ceiling at full dial (TWEAK_BURST), boot default from OSSM_Config.h
-float tweakDialRpm = ROTATION_MAX_RPM;      // RPM that 100% on the rotation dial means (TWEAK_DIAL)
-float tweakSpare = 0.0f;                    // reserved (TWEAK_SPARE), no effect yet
-float rotationAppliedDialRpm = ROTATION_MAX_RPM;   // dial max currently applied to the engine
+float tweakDialRpm = ROTATION_MAX_RPM;      // hard RPM cap; rotation dial 100% means this (TWEAK_DIAL)
+bool tweakReverse = false;                  // runtime axis flip on top of ROTATION_INVERT_DIRECTION (TWEAK_REVERSE), saved in flash
+volatile bool tweakReverseSavePending = false;   // set in the ESP-NOW callback, written to flash from loop()
 
 #define HEARTBEAT_INTERVAL 3000/portTICK_PERIOD_MS	// 3 seconds (remote sends every 0.5 s); also the rotation failsafe timeout
 volatile TickType_t lastHeartbeatTime = 0;
@@ -247,6 +247,7 @@ void strokeTelemetryCallback(float position, float speed, bool clipping) {
 // ---- Combos -------------------------------------------------------------
 // Matched by pattern name so a reordered table can't silently break them.
 // Rotation speed is set once on apply; the rotation dial overrides it afterwards.
+// The remote keeps a mirror of this table (comboUI in the remote's main.cpp): same order, same names.
 struct ComboDef {
   const char* name;
   const char* strokePattern;
@@ -339,6 +340,14 @@ void pedclick();
 
 float getAnalogAverage(int pinNumber, int samples);
 
+// Fill the rotation/tweak state the remote mirrors (pairing and reconnect both send this).
+void fillRotationStateForRemote() {
+  outgoingcontrol.esp_rotation_speed = rotationSpeedPct; outgoingcontrol.esp_rotation_direction = rotationReverse ? 1.0f : 0.0f;
+  outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
+  outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_burst = rotationBurstPct; outgoingcontrol.esp_combo = (float)currentCombo;
+  outgoingcontrol.esp_tweak_burst = 0.0f; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_reverse = tweakReverse ? 1.0f : 0.0f;
+}
+
 // Homing Feedback Serial
 void homingNotification(bool isHomed) {
   if (isHomed) {
@@ -350,10 +359,7 @@ void homingNotification(bool isHomed) {
       outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
       outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
       outgoingcontrol.esp_pattern = Stroker.getPattern();
-      outgoingcontrol.esp_rotation_speed = rotationSpeedPct; outgoingcontrol.esp_rotation_direction = rotationReverse ? 1.0f : 0.0f;
-      outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
-      outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_overdrive = rotationOverdrive ? 1.0f : 0.0f; outgoingcontrol.esp_combo = (float)currentCombo;
-      outgoingcontrol.esp_tweak_burst = tweakBurstRpm; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_spare = tweakSpare;
+      fillRotationStateForRemote();
       outgoingcontrol.esp_target = M5_ID;
       esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
       m5_paired = true;
@@ -365,23 +371,11 @@ void homingNotification(bool isHomed) {
   }
 }
 
-// Apply the Tweak screen's burst ceiling and dial max to the rotation engine while it runs.
-// The engine thinks in a factor (ceiling = maxRpm x factor), so convert: factor = burst / dial.
-// The burst ceiling can never sit below the dial max (the engine also refuses a factor under 1.0).
-// Order matters so the clamp never overshoots for a tick: raising the dial lowers the factor first,
-// lowering the dial changes the dial first.
+// Apply the Tweak screen's dial cap to the rotation engine while it runs.
+// The cap is HARD: the engine clamps every output to it. The burst speed follows it
+// (burst percent of the cap), which setMaxRpm() re-pushes to the patterns.
 void applyRotationTweak(){
-  float dial = tweakDialRpm;
-  float burst = (tweakBurstRpm < dial) ? dial : tweakBurstRpm;
-  float factor = burst / dial;
-  if (dial > rotationAppliedDialRpm) {
-    Rotator.setOverdriveFactor(factor);
-    Rotator.setMaxRpm(dial);
-  } else {
-    Rotator.setMaxRpm(dial);
-    Rotator.setOverdriveFactor(factor);
-  }
-  rotationAppliedDialRpm = dial;
+  Rotator.setMaxRpm(tweakDialRpm);
   Rotator.setSpeedPercent(rotationSpeedPct);   // setMaxRpm() does not refresh the active pattern's base speed
 }
 
@@ -554,18 +548,16 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               Rotator.setRotationSensation(rotationSensationPct);
               break;
             }
-            case ROT_OVERDRIVE: {
-              rotationOverdrive = (incomingcontrol.esp_value != 0.0f);
-              Rotator.setOverdrive(rotationOverdrive);
+            case ROT_BURST: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v)) {
+                rotationBurstPct = constrain(v, 0.0f, 100.0f);
+                Rotator.setBurstPercent(rotationBurstPct);
+              }
               break;
             }
             case COMBO: {
               applyCombo((int)incomingcontrol.esp_value);
-              break;
-            }
-            case TWEAK_BURST: {
-              float v = incomingcontrol.esp_value;
-              if (std::isfinite(v) && v >= 1.0f) { tweakBurstRpm = v; applyRotationTweak(); }
               break;
             }
             case TWEAK_DIAL: {
@@ -573,9 +565,10 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               if (std::isfinite(v) && v >= 1.0f) { tweakDialRpm = v; applyRotationTweak(); }
               break;
             }
-            case TWEAK_SPARE: {
-              float v = incomingcontrol.esp_value;
-              if (std::isfinite(v)) { tweakSpare = v; }   // reserved, nothing reads it yet
+            case TWEAK_REVERSE: {
+              tweakReverse = (incomingcontrol.esp_value != 0.0f);
+              Rotator.setInvertDirection(ROTATION_INVERT_DIRECTION != tweakReverse);   // XOR with the compile-time baseline
+              tweakReverseSavePending = true;   // flash write happens in loop(), not in this callback
               break;
             }
             case TORQE_F: {
@@ -634,10 +627,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
             outgoingcontrol.esp_speed = USER_SPEEDLIMIT;
             outgoingcontrol.esp_depth = strokingMachine.physicalTravel;
             outgoingcontrol.esp_pattern = Stroker.getPattern();
-            outgoingcontrol.esp_rotation_speed = rotationSpeedPct; outgoingcontrol.esp_rotation_direction = rotationReverse ? 1.0f : 0.0f;
-            outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
-      outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_overdrive = rotationOverdrive ? 1.0f : 0.0f; outgoingcontrol.esp_combo = (float)currentCombo;
-      outgoingcontrol.esp_tweak_burst = tweakBurstRpm; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_spare = tweakSpare;
+            fillRotationStateForRemote();
             outgoingcontrol.esp_target = M5_ID;
             esp_err_t result = esp_now_send(m5RemoteAddress, (uint8_t *) &outgoingcontrol, sizeof(outgoingcontrol));
 
@@ -746,12 +736,21 @@ void setup() {
 
   Serial.printf("useSensorlessHoming: %s (EEPROM hw version %d ignored)\n", USE_SENSORLESS_HOMING ? "yes" : "no", hardwareVersion);
 
+  // Saved Reverse (runtime axis flip) must be applied before Rotator.begin() so the DIR pin starts at the right level.
+  {
+    Preferences rotPrefs;
+    rotPrefs.begin("ossm-rot", true);
+    tweakReverse = rotPrefs.getBool("inv", false);
+    rotPrefs.end();
+  }
+
   Stroker.begin(&strokingMachine, &servoMotor); // Setup Stroke Engine
+  Rotator.setInvertDirection(ROTATION_INVERT_DIRECTION != tweakReverse);
   Rotator.begin();                              // J9 pins + LEDC, stays disabled
   Rotator.setPulsesPerRev(ROTATION_PULSES_PER_REV);
-  Rotator.setMaxRpm(ROTATION_MAX_RPM);
+  Rotator.setMaxRpm(ROTATION_MAX_RPM);          // hard cap, boot value of the Tweak dial
+  Rotator.setBurstPercent(ROTATION_BURST_PERCENT);
   Rotator.setLivePositionProvider(strokeLivePositionMm);
-  Rotator.setOverdriveFactor(ROTATION_OVERDRIVE_FACTOR);
   Rotator.setMaxAccelRpmPerSec(ROTATION_MAX_ACCEL_RPM_PER_S);
   Rotator.setReversalSafeRpm(ROTATION_REVERSAL_SAFE_RPM);
   Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(Stroker.getPattern()));
@@ -823,6 +822,13 @@ void setup() {
 
 void loop() {
   g_ui.UpdateScreen();
+  if (tweakReverseSavePending) {          // flash write kept out of the ESP-NOW callback
+    tweakReverseSavePending = false;
+    Preferences rotPrefs;
+    rotPrefs.begin("ossm-rot", false);
+    rotPrefs.putBool("inv", tweakReverse);
+    rotPrefs.end();
+  }
   //PED.tick();
   //ALM.tick();
 }
