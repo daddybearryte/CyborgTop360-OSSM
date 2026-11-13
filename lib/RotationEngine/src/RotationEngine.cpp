@@ -11,6 +11,13 @@
 // this shares core 0 with (see xTaskCreatePinnedToCore call in main.cpp).
 #define ROTATION_TICK_MS 30
 
+// Direction-change dwell. When a reversal is carried out, the pulse train is
+// held off for this long before the DIR edge and again after it, so the driver
+// never sees a step pulse coincident with DIR changing (opto setup time) and
+// the gearbox gets a brief unloaded moment at the turnaround. Blocks the
+// rotation task for twice this value, only on an actual reversal.
+#define ROTATION_REVERSAL_DWELL_MS 5
+
 RotationEngine::RotationEngine(uint8_t pulsePin, uint8_t dirPin, uint8_t enablePin,
                                 bool invertDirection, bool enableActiveHigh,
                                 uint8_t ledcChannel, uint8_t ledcResolutionBits)
@@ -194,12 +201,20 @@ void RotationEngine::_applyTarget(const rotationMotionParameter &target) {
     // output has slowed to _reversalSafeRpm: until then the target is capped
     // at that speed, so the axis decelerates, flips, then ramps back up.
     // The min-interval floor still applies as the backstop on reversal rate.
+    // The flip itself is wrapped in a pulse-off dwell (see
+    // ROTATION_REVERSAL_DWELL_MS) so DIR never changes under a running pulse train.
     bool wantReverse = target.reverse != _invertDirection; // XOR against wiring inversion
     if (wantReverse != _lastDirWritten && (now - _lastDirChangeMillis >= _minReversalIntervalMs)) {
         if (_currentRpm <= _reversalSafeRpm + 0.01f) {
+            ledcWrite(_ledcChannel, 0);          // pulses off
+            _lastHz = 0;                         // force LEDC re-setup when pulses resume
+            delay(ROTATION_REVERSAL_DWELL_MS);   // let the last pulse clear
             digitalWrite(_dirPin, wantReverse ? HIGH : LOW);
+            delay(ROTATION_REVERSAL_DWELL_MS);   // DIR setup time before the next pulse
             _lastDirWritten = wantReverse;
+            now = millis();
             _lastDirChangeMillis = now;
+            _lastApplyMillis = now;              // dwell time must not count as slew time
         } else if (rpm > _reversalSafeRpm) {
             rpm = _reversalSafeRpm;   // slow down first, flip on a later tick
         }
