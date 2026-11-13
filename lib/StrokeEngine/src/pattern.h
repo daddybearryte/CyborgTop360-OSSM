@@ -994,93 +994,9 @@ class DepthPulse : public Pattern {
         }
 };
 
-/**************************************************************************/
-/*!
-  @brief  Burst, then pull out. A run of fast full-length strokes (the
-  burst), followed by one slow pull-out, then the run starts again.
-
-  The Speed dial sets the burst: the in and out legs of the burst strokes
-  run at the normal Simple Stroke profile for the dialed speed. The pull-out
-  is the out leg of the LAST stroke in the run, stretched to take longer.
-  Sensation sets how much slower: at -100 the pull-out takes 2x as long as a
-  burst out-leg, at +100 it takes 10x as long (geometric in between, so the
-  middle of the slider is about 4.5x). The burst length is the number of
-  fast strokes per run (setBurstCount(), default 5), counted in whole
-  in+out strokes, the final one of which ends in the slow pull-out.
-
-  Stateless: the leg is derived from the stroke index alone, so there is no
-  timer to drift and a skipped call cannot desync it. The StrokeEngine
-  restarts the index at 0 whenever the pattern starts or is changed.
-
-  Reversal note for the rotation axis: the burst legs reverse exactly as
-  often as Simple Stroke at the same dial speed, so this pattern is NOT in
-  main.cpp's vibration-heavy list and Screw Sync follows it normally.
-*/
-/**************************************************************************/
-class BurstPullOut : public Pattern {
-    public:
-        BurstPullOut(const char *str) : Pattern(str) { _updatePullOutFactor(); }
-
-        void setTimeOfStroke(float speed = 0) {
-            // In & Out have same time, so we need to divide by 2
-            _timeOfStroke = 0.5 * speed;
-        }
-
-        //! Sensation sets how much slower the pull-out is than a burst out-leg.
-        void setSensation(float sensation) {
-            _sensation = sensation;
-            _updatePullOutFactor();
-        }
-
-        //! Number of fast strokes (in+out) per run, the last of which ends in the slow pull-out. Minimum 1.
-        void setBurstCount(int count) { _burstCount = (count < 1) ? 1 : count; }
-
-        //! Pull-out duration as a multiple of a burst out-leg: minFactor at Sensation -100, maxFactor at +100.
-        void setPullOutFactorRange(float minFactor, float maxFactor) {
-            _minFactor = (minFactor < 1.0f) ? 1.0f : minFactor;
-            _maxFactor = (maxFactor < _minFactor) ? _minFactor : maxFactor;
-            _updatePullOutFactor();
-        }
-
-        motionParameter nextTarget(unsigned int index) {
-            unsigned int legsPerRun = 2 * (unsigned int)_burstCount;
-            bool movingOut = (index % 2) != 0;
-            bool isPullOut = movingOut && ((index % legsPerRun) == (legsPerRun - 1));
-
-            // Time of this leg: a normal half-stroke, or the stretched pull-out.
-            float legTime = isPullOut ? (_timeOfStroke * _pullOutFactor) : _timeOfStroke;
-
-            // maximum speed of the trapezoidal motion
-            _nextMove.speed = int(1.5 * _stroke / legTime);
-
-            // acceleration to meet the profile (1/3 - 1/3 - 1/3)
-            _nextMove.acceleration = int(3.0 * float(_nextMove.speed) / legTime);
-
-            _nextMove.stroke = movingOut ? (_depth - _stroke) : _depth;
-            _nextMove.skip = false;
-
-#ifdef DEBUG_PATTERN
-            if (isPullOut) {
-                Serial.println("Burst pull-out, x" + String(_pullOutFactor, 2) + " slower");
-            }
-#endif
-
-            _index = index;
-            return _nextMove;
-        }
-
-    protected:
-        int _burstCount = 5;
-        float _minFactor = 2.0f;
-        float _maxFactor = 10.0f;
-        float _pullOutFactor = 4.5f;
-
-        void _updatePullOutFactor() {
-            // geometric between minFactor (Sensation -100) and maxFactor (Sensation +100)
-            float t = (constrain(_sensation, -100.0f, 100.0f) + 100.0f) / 200.0f;
-            _pullOutFactor = _minFactor * powf(_maxFactor / _minFactor, t);
-        }
-};
+// Burst Pull-out lives in its own header so its tuning can change without touching this file again.
+// It needs Pattern and motionParameter from above, so the include has to stay here, before patternTable[].
+#include "BurstPullOut.h"
 
 /**************************************************************************/
 /*
