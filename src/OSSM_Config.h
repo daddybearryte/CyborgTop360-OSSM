@@ -42,12 +42,11 @@
 
 // --- Rotation axis config ---
 #define ROTATION_PULSES_PER_REV   4000    // 400 pulses/rev DIP x ~10:1 reduction (measured)
-#define ROTATION_MAX_RPM          100.0   // raise once verified unloaded
-#define ROTATION_BURST_RPM        120.0   // absolute rotation burst ceiling in RPM at full dial; boot default, the remote Tweak screen changes it live
-#define ROTATION_OVERDRIVE_FACTOR (ROTATION_BURST_RPM / ROTATION_MAX_RPM)   // ceiling = MAX_RPM x this; patterns reach it only with Overdrive on
+#define ROTATION_MAX_RPM          100.0   // HARD CAP on rotation speed in RPM: nothing ever exceeds it. Also the boot value of the remote Tweak "Dial" (rotation dial 100% = this). Raise once verified unloaded.
+#define ROTATION_BURST_PERCENT    100.0   // boot value of the remote's rotation Burst slider, percent of the cap above. Burst phases (Depth Trigger Spin) spin at this speed.
 #define ROTATION_MAX_ACCEL_RPM_PER_S 300.0   // output slew limit in RPM per second, 0 = off. Lower it if the driver still faults.
 #define ROTATION_REVERSAL_SAFE_RPM   20.0    // direction flips only at or below this RPM; the axis slows to it first
-#define ROTATION_INVERT_DIRECTION false   // flip if it spins backwards (direct drive is active-low)
+#define ROTATION_INVERT_DIRECTION false   // compile-time baseline. The remote Tweak "Reverse" checkbox flips it at runtime (saved across reboots).
 #define ROTATION_ENABLE_ACTIVE_HIGH true  // unused while ENA is unwired
 
 // Stroke Sensation response curve, applied where the remote's SENSATION command arrives.
