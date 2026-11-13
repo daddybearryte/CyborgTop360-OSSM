@@ -71,6 +71,16 @@
  *   Speed-knob-scaled value every other pattern uses. Harmless for every
  *   pattern that doesn't use it.
  *   ==========================================================================
+ *
+ *   ==========================================================================
+ *   2026-11-12 update: overdrive is gone. setMaxRpm() is now a HARD CAP:
+ *   _applyTarget() clamps every output to it, no exceptions. The value
+ *   pushed to patterns via setMaxRpmCeiling() is no longer the cap itself
+ *   but the BURST speed (cap x burst percent, see setBurstPercent()), so
+ *   burst phases (Depth Trigger Spin) spin at the burst slider's speed.
+ *   Added setInvertDirection() so the whole axis can be flipped at runtime
+ *   (remote Tweak "Reverse") without reflashing.
+ *   ==========================================================================
  */
 
 #pragma once
@@ -115,12 +125,23 @@ class RotationEngine {
         //! (checkpoint doc: DIP switches set 400-40000 pulses/rev).
         void setPulsesPerRev(uint32_t ppr) { _pulsesPerRev = ppr; }
 
-        //! Ceiling RPM - what 100% speed maps to. Also pushed to every
-        //! pattern's setMaxRpmCeiling() (not just the active one) so a
-        //! pattern that needs the true ceiling - bypassing the Speed
-        //! knob, like Depth Trigger Spin's burst phase - always has a
-        //! current value even if it's selected after this is called.
+        //! HARD CAP in RPM - what 100% speed maps to, and the ceiling every
+        //! output is clamped to in _applyTarget(). Nothing exceeds it. Also
+        //! re-pushes the burst speed (cap x burst percent) to every pattern.
         void setMaxRpm(float rpm);
+
+        //! Burst speed as a percent (0-100) of the cap set by setMaxRpm().
+        //! Pushed to every pattern through setMaxRpmCeiling(), so a pattern
+        //! with a burst phase (Depth Trigger Spin) spins at this speed
+        //! regardless of the Speed knob. 100 = the cap itself.
+        void setBurstPercent(float percent);
+        float getBurstPercent() { return _burstPercent; }
+
+        //! Flip the whole axis's direction at runtime, on top of the
+        //! constructor's invertDirection (the caller passes the combined
+        //! value). Takes effect through the normal reversal path: the axis
+        //! decelerates, pauses pulses, flips DIR, ramps back up.
+        void setInvertDirection(bool invert) { _invertDirection = invert; }
 
         //! Speed knob value from the M5 remote, 0-100. Converted to RPM against
         //! maxRpm and pushed into whichever pattern is currently active.
@@ -192,18 +213,8 @@ class RotationEngine {
         //! on it today.
         void setSyncedStrokeSensation(float rawSensation);
 
-        //! Overdrive on/off. When on, patterns' peaks can reach the
-        //! overdrive factor times the dial value (Depth Trigger Spin's burst
-        //! reaches factor x max). Off at boot. The dial itself never exceeds 100%.
-        void setOverdrive(bool enabled);
-        bool getOverdrive() { return _overdriveEnabled; }
-
-        //! Absolute ceiling multiplier (ROTATION_OVERDRIVE_FACTOR, 1.10).
-        //! Also the final clamp in _applyTarget(), whether overdrive is on or off.
-        void setOverdriveFactor(float factor) { _overdriveFactor = (factor < 1.0f) ? 1.0f : factor; _pushPeakScale(); }
-
         //! Rotation Sensation from the remote, -100 to 100. Stored and
-        //! forwarded to every pattern. No pattern acts on it yet.
+        //! forwarded to every pattern.
         void setRotationSensation(float percent);
         float getRotationSensationPercent() { return _rotationSensationPercent; }
 
@@ -288,6 +299,7 @@ class RotationEngine {
 
         uint32_t _pulsesPerRev = 1000;
         float _maxRpm = 200.0f;
+        float _burstPercent = 100.0f;
         float _speedPercent = 0.0f;
         bool _baseDirection = false;
         uint8_t _patternIndex = 0;
@@ -298,15 +310,13 @@ class RotationEngine {
         bool _strokeSyncSafe = true;   // last value fed via setStrokePatternSafeForSync()
         bool _syncSafetyOverrideEnabled = true;
         uint32_t _minReversalIntervalMs = 250;
-        bool _overdriveEnabled = false;
         float _maxAccelRpmPerSec = 300.0f;   // output slew limit, see setMaxAccelRpmPerSec()
         float _reversalSafeRpm = 20.0f;      // flip DIR only at or below this, see setReversalSafeRpm()
         float _currentRpm = 0.0f;            // RPM actually being output right now
         unsigned long _lastApplyMillis = 0;
         uint32_t _lastHz = 0;                // last LEDC frequency set, skip ledcSetup() when unchanged
-        float _overdriveFactor = 1.10f;
         float _rotationSensationPercent = 0.0f;
-        void _pushPeakScale();
+        void _pushBurst();
 
         // Position/speed sync - raw values + normalization ranges. See the
         // class-level placeholder-range note at the top of this file.
