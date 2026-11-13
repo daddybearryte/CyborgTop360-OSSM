@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <StrokeEngine.h>     // Include Stroke Engine
+#include <BurstTuning.h>      // Live tuning for the Burst Pull-out stroke pattern (count, pull-out scale)
 #include "OSSM_Config.h"      // START HERE FOR Configuration
 #include "OSSM_PinDEF.h"      // This is where you set pins specific for your board
 #include "FastLED.h"          // Used for the LED on the Reference Board (or any other pixel LEDS you may add)
@@ -64,6 +65,8 @@ const char* password = PASSWORD; // Add your password in arduino_secrets.h
 #define TWEAK_DIAL 39       // rotation dial cap in RPM, hard ceiling
 #define TWEAK_REVERSE 40    // flip the whole rotation axis direction (was TWEAK_SPARE)
 #define RETRACT 41
+#define TWEAK_BURST_COUNT 42   // Burst Pull-out: fast strokes per run, 1 to 12
+#define TWEAK_PULL_SCALE 43    // Burst Pull-out: scales the whole pull-out slowdown range, percent, 50 to 200
 #define CONNECT 88
 #define HEARTBEAT 99
 
@@ -121,6 +124,8 @@ typedef struct struct_message {
   float esp_tweak_burst;        // retired, always 0 (keeps the struct layout identical on both sides)
   float esp_tweak_dial;         // dial cap RPM (must match remote)
   float esp_tweak_reverse;      // 0.0 = as configured, non-zero = axis direction flipped (must match remote)
+  float esp_tweak_burst_count;  // Burst Pull-out strokes per run (must match remote)
+  float esp_tweak_pull_scale;   // Burst Pull-out slowdown scale, percent (must match remote)
 } struct_message;
 
 esp_now_peer_info_t peerInfo;
@@ -137,6 +142,8 @@ int currentCombo = -1;           // last applied combo index, -1 after any manua
 float tweakDialRpm = ROTATION_MAX_RPM;      // hard RPM cap; rotation dial 100% means this (TWEAK_DIAL)
 bool tweakReverse = false;                  // runtime axis flip on top of ROTATION_INVERT_DIRECTION (TWEAK_REVERSE), saved in flash
 volatile bool tweakReverseSavePending = false;   // set in the ESP-NOW callback, written to flash from loop()
+int tweakBurstCount = 5;                    // Burst Pull-out strokes per run (TWEAK_BURST_COUNT), echoed to the remote
+float tweakPullScalePct = 100.0f;           // Burst Pull-out slowdown scale in percent (TWEAK_PULL_SCALE), echoed to the remote
 
 #define HEARTBEAT_INTERVAL 3000/portTICK_PERIOD_MS	// 3 seconds (remote sends every 0.5 s); also the rotation failsafe timeout
 volatile TickType_t lastHeartbeatTime = 0;
@@ -355,6 +362,7 @@ void fillRotationStateForRemote() {
   outgoingcontrol.esp_rotation_pattern = Rotator.getPattern();
   outgoingcontrol.esp_rotation_sensation = rotationSensationPct; outgoingcontrol.esp_rotation_burst = rotationBurstPct; outgoingcontrol.esp_combo = (float)currentCombo;
   outgoingcontrol.esp_tweak_burst = 0.0f; outgoingcontrol.esp_tweak_dial = tweakDialRpm; outgoingcontrol.esp_tweak_reverse = tweakReverse ? 1.0f : 0.0f;
+  outgoingcontrol.esp_tweak_burst_count = (float)tweakBurstCount; outgoingcontrol.esp_tweak_pull_scale = tweakPullScalePct;
 }
 
 // Homing Feedback Serial
@@ -580,6 +588,22 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
               tweakReverseSavePending = true;   // flash write happens in loop(), not in this callback
               break;
             }
+            case TWEAK_BURST_COUNT: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v)) {
+                tweakBurstCount = constrain((int)(v + 0.5f), 1, 12);
+                burstPullOutTuning().count = tweakBurstCount;   // read by Burst Pull-out on every stroke
+              }
+              break;
+            }
+            case TWEAK_PULL_SCALE: {
+              float v = incomingcontrol.esp_value;
+              if (std::isfinite(v)) {
+                tweakPullScalePct = constrain(v, 50.0f, 200.0f);
+                burstPullOutTuning().pullScale = tweakPullScalePct / 100.0f;
+              }
+              break;
+            }
             case TORQE_F: {
               int torqe = incomingcontrol.esp_value * 10;
               LogDebug(torqe);
@@ -763,6 +787,8 @@ void setup() {
   Rotator.setMaxAccelRpmPerSec(ROTATION_MAX_ACCEL_RPM_PER_S);
   Rotator.setReversalSafeRpm(ROTATION_REVERSAL_SAFE_RPM);
   Rotator.setStrokePatternSafeForSync(!isVibrationHeavyStrokePattern(Stroker.getPattern()));
+  burstPullOutTuning().count = tweakBurstCount;                       // Burst Pull-out boot values
+  burstPullOutTuning().pullScale = tweakPullScalePct / 100.0f;
   Stroker.registerTelemetryCallback(strokeTelemetryCallback);
   if (USE_SENSORLESS_HOMING)
   {
