@@ -51,6 +51,7 @@ void RotationEngine::begin() {
     for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
         rotationPatternTable[i]->setBaseSpeed(0.0f);
     }
+    _pushBurst();
 }
 
 void RotationEngine::enable() {
@@ -67,8 +68,20 @@ void RotationEngine::disable() {
 
 void RotationEngine::setMaxRpm(float rpm) {
     _maxRpm = rpm;
+    _pushBurst();
+}
+
+void RotationEngine::setBurstPercent(float percent) {
+    _burstPercent = constrain(percent, 0.0f, 100.0f);
+    _pushBurst();
+}
+
+// Patterns with a burst phase read setMaxRpmCeiling() as "how fast to burst".
+// That is the burst speed (cap x burst percent), never above the hard cap.
+void RotationEngine::_pushBurst() {
+    float burstRpm = _maxRpm * (_burstPercent / 100.0f);
     for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
-        rotationPatternTable[i]->setMaxRpmCeiling(rpm);
+        rotationPatternTable[i]->setMaxRpmCeiling(burstRpm);
     }
 }
 
@@ -136,18 +149,6 @@ void RotationEngine::setSyncedStrokeSensation(float rawSensation) {
     }
 }
 
-void RotationEngine::_pushPeakScale() {
-    float scale = _overdriveEnabled ? _overdriveFactor : 1.0f;
-    for (unsigned int i = 0; i < rotationPatternTableSize; i++) {
-        rotationPatternTable[i]->setPeakScale(scale);
-    }
-}
-
-void RotationEngine::setOverdrive(bool enabled) {
-    _overdriveEnabled = enabled;
-    _pushPeakScale();
-}
-
 void RotationEngine::setRotationSensation(float percent) {
     _rotationSensationPercent = constrain(percent, -100.0f, 100.0f);
     float fraction = _rotationSensationPercent / 100.0f;
@@ -194,8 +195,7 @@ void RotationEngine::_applyTarget(const rotationMotionParameter &target) {
 
     unsigned long now = millis();
     float rpm = target.rpm;
-    float rpmCeiling = _maxRpm * _overdriveFactor;   // absolute backstop, applies to every pattern
-    if (rpm > rpmCeiling) rpm = rpmCeiling;
+    if (rpm > _maxRpm) rpm = _maxRpm;   // HARD CAP: nothing, from any pattern, ever exceeds it
 
     // Direction is a static level. A reversal is only carried out once the
     // output has slowed to _reversalSafeRpm: until then the target is capped
