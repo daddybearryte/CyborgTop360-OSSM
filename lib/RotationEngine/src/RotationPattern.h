@@ -54,6 +54,14 @@
  *   Trigger Spin, Random Bursts and Threshold Burst spin at it during their
  *   burst phase (the last two via _burstTarget(), never below the Speed knob).
  *   ==========================================================================
+ *
+ *   ==========================================================================
+ *   2026-11-13 update: Threshold Burst's gate has hysteresis (no chatter at the
+ *   threshold). Drunken Walk now responds to Rotation Sensation (scales both
+ *   its direction-flip interval and its speed-step interval). Depth-linked
+ *   patterns now get position normalized against the commanded depth window
+ *   (see strokeTelemetryCallback in main.cpp).
+ *   ==========================================================================
  */
 
 #pragma once
@@ -123,7 +131,7 @@ class RotationPattern {
 
         //! Rotation Sensation, -1.0 to 1.0, pushed by RotationEngine from the
         //! remote's rotation Sensation dial. Acts on: Screw Sync, Threshold Burst,
-        //! Alternating Sweep, Random Bursts, Metronome Flip, Depth Trigger Spin.
+        //! Alternating Sweep, Random Bursts, Metronome Flip, Drunken Walk, Depth Trigger Spin.
         //! Convention: negative = faster / shorter / more frequent, positive =
         //! slower / longer / less frequent, 0 = the pattern's default behavior.
         virtual void setRotationSensation(float fraction) { _rotationSensationFraction = constrain(fraction, -1.0f, 1.0f); }
@@ -654,8 +662,11 @@ class DepthSurge : public RotationPattern {
   @brief  Idles at a low resting speed for most of the stroke, then
   bursts to the Burst slider's speed (never below the Speed knob) only
   once stroke depth crosses a threshold fraction - a gate rather than
-  Depth Surge's continuous ramp. Direction is the user's manual choice;
-  no motor-safety considerations (speed only, same as Depth Surge).
+  Depth Surge's continuous ramp. The gate has hysteresis: it opens at the
+  threshold and only closes again once the stroke has dropped a little
+  below it, so position noise right at the threshold cannot chatter the
+  speed. Direction is the user's manual choice; no motor-safety
+  considerations (speed only, same as Depth Surge).
 
   Same feed requirement as Depth Surge - RotationEngine::setSyncedStrokePosition().
 */
@@ -671,6 +682,11 @@ class ThresholdBurst : public RotationPattern {
             _restFraction = restFraction;
         }
 
+        void reset(unsigned long nowMillis) {
+            _phaseStartMillis = nowMillis;
+            _pastThreshold = false;
+        }
+
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
             // Rotation Sensation moves the threshold: negative = shallower
             // (speeds up sooner), positive = deeper (only near full depth),
@@ -679,8 +695,13 @@ class ThresholdBurst : public RotationPattern {
             float threshold = (s < 0.0f)
                 ? _thresholdFraction + s * (_thresholdFraction - _thresholdMinFraction)
                 : _thresholdFraction + s * (_thresholdMaxFraction - _thresholdFraction);
-            bool pastThreshold = _strokePositionFraction >= threshold;
-            _nextMove.rpm = pastThreshold ? _burstTarget() : (_baseRpm * _restFraction);
+            // Hysteresis: open at the threshold, close only once below threshold - margin.
+            if (_pastThreshold) {
+                if (_strokePositionFraction < threshold - _hysteresisFraction) _pastThreshold = false;
+            } else if (_strokePositionFraction >= threshold) {
+                _pastThreshold = true;
+            }
+            _nextMove.rpm = _pastThreshold ? _burstTarget() : (_baseRpm * _restFraction);
             _nextMove.reverse = _baseDirection;
             _nextMove.skip = false;
             return _nextMove;
@@ -691,6 +712,8 @@ class ThresholdBurst : public RotationPattern {
         float _thresholdMinFraction = 0.3f;   // threshold at Rotation Sensation -1.0
         float _thresholdMaxFraction = 0.98f;  // threshold at Rotation Sensation +1.0
         float _restFraction = 0.2f;
+        float _hysteresisFraction = 0.05f;    // gate closes this far below the threshold
+        bool _pastThreshold = false;
 };
 
 /**************************************************************************/
@@ -931,10 +954,16 @@ class MetronomeFlip : public RotationPattern {
   Direction Bursts' burst-gated flips. Self-contained, no stroke
   telemetry, no stroke-sync guard needed.
 
+  Rotation Sensation scales how often things change: negative = more
+  often (both the direction-flip interval and the speed-step interval
+  shrink, down to 0.25x), positive = less often (up to 4x), 0 = the
+  configured intervals.
+
   Default direction-walk interval (2-9s) sits well above the 250ms floor.
-  If you narrow _dirMinMs much below ~500-1000ms, bench-check the actual
-  resulting reversal cadence - a random walk's minimum interval, not its
-  average, is what can brush up against the engine's backstop.
+  At the fastest sensation setting (0.25x) the shortest direction interval
+  is 500ms. If you narrow _dirMinMs much below ~500-1000ms, bench-check the
+  actual resulting reversal cadence - a random walk's minimum interval, not
+  its average, is what can brush up against the engine's backstop.
 */
 /**************************************************************************/
 class DrunkenWalk : public RotationPattern {
@@ -956,20 +985,21 @@ class DrunkenWalk : public RotationPattern {
         void reset(unsigned long nowMillis) {
             _phaseStartMillis = nowMillis;
             _reverse = _baseDirection;
-            _nextDirEventMillis = nowMillis + random(_dirMinMs, _dirMaxMs);
-            _nextSpeedStepMillis = nowMillis + _speedStepMs;
+            _nextDirEventMillis = nowMillis + _randomInterval(_dirMinMs, _dirMaxMs, _sensScale());
+            _nextSpeedStepMillis = nowMillis + (unsigned long)((float)_speedStepMs * _sensScale());
             _speedFraction = 0.6f; // start mid-range rather than snapping from 0 on activation
         }
 
         rotationMotionParameter nextTarget(unsigned long nowMillis) {
+            float scale = _sensScale();   // Rotation Sensation: 0.25x (more often) to 4x (less often)
             if (nowMillis >= _nextDirEventMillis) {
                 _reverse = !_reverse;
-                _nextDirEventMillis = nowMillis + random(_dirMinMs, _dirMaxMs);
+                _nextDirEventMillis = nowMillis + _randomInterval(_dirMinMs, _dirMaxMs, scale);
             }
             if (nowMillis >= _nextSpeedStepMillis) {
                 float step = ((float)random(-1000, 1001) / 1000.0f) * _maxStepFraction;
                 _speedFraction = constrain(_speedFraction + step, _minFraction, 1.0f);
-                _nextSpeedStepMillis = nowMillis + _speedStepMs;
+                _nextSpeedStepMillis = nowMillis + (unsigned long)((float)_speedStepMs * scale);
             }
             float peakBoost = 1.0f;
             if (_speedFraction > 0.8f) {
@@ -982,6 +1012,14 @@ class DrunkenWalk : public RotationPattern {
         }
 
     protected:
+        //! Random interval in [minMs, maxMs), both scaled, never an empty range.
+        unsigned long _randomInterval(unsigned long minMs, unsigned long maxMs, float scale) const {
+            unsigned long lo = (unsigned long)((float)minMs * scale);
+            unsigned long hi = (unsigned long)((float)maxMs * scale);
+            if (hi <= lo) hi = lo + 1;
+            return (unsigned long)random(lo, hi);
+        }
+
         unsigned long _dirMinMs = 2000, _dirMaxMs = 9000;
         unsigned long _speedStepMs = 600;
         unsigned long _nextDirEventMillis = 0;
