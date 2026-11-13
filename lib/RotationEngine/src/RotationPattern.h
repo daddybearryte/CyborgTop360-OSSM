@@ -47,6 +47,13 @@
  *   end design. See the class's own header comment for the full
  *   walkthrough.
  *   ==========================================================================
+ *
+ *   ==========================================================================
+ *   2026-11-12 update: setMaxRpmCeiling() now carries the BURST speed
+ *   (hard cap x the remote's Burst slider percent), not the raw cap. Depth
+ *   Trigger Spin, Random Bursts and Threshold Burst spin at it during their
+ *   burst phase (the last two via _burstTarget(), never below the Speed knob).
+ *   ==========================================================================
  */
 
 #pragma once
@@ -98,24 +105,20 @@ class RotationPattern {
         //! against the configured max RPM.
         virtual void setBaseSpeed(float rpm) { _baseRpm = rpm; }
 
-        //! The engine's TRUE speed ceiling (RotationEngine's own
-        //! setMaxRpm() value), independent of the Speed knob. Most
-        //! patterns never need this - setBaseSpeed() above is already the
-        //! knob-scaled value every other pattern uses as "full speed."
-        //! This exists for patterns that deliberately need to bypass the
-        //! knob and spin at the machine's actual maximum regardless of
-        //! what the user has Speed set to (Depth Trigger Spin's burst
-        //! phase is the only one that does this today). Pushed to every
-        //! pattern whenever RotationEngine::setMaxRpm() is called, not
-        //! just the active one, so it's always current if a pattern that
-        //! needs it gets selected later.
+        //! The BURST speed in RPM (RotationEngine's hard cap x the remote's
+        //! Burst slider percent), independent of the Speed knob. Patterns
+        //! with a burst phase use it as the speed to burst at: Depth Trigger
+        //! Spin spins at it directly, Random Bursts and Threshold Burst use it
+        //! through _burstTarget() (never below the Speed knob). Every other
+        //! pattern ignores it. Pushed to every pattern whenever the cap or
+        //! the burst percent changes, not just the active one, so it's
+        //! always current if a pattern that needs it gets selected later.
         virtual void setMaxRpmCeiling(float maxRpm) { _maxRpmCeiling = maxRpm; }
 
-        //! Overdrive peak scale pushed by RotationEngine: 1.0 when overdrive
-        //! is off, ROTATION_OVERDRIVE_FACTOR when on. Patterns that have a
-        //! "peak" (burst top, top of a speed walk, Depth Trigger Spin's burst)
-        //! multiply that peak by this. Everything below the peak stays
-        //! dial-relative.
+        //! Overdrive peak scale. No longer pushed by RotationEngine (overdrive
+        //! was replaced by the Burst slider); stays at 1.0 so the peak
+        //! multipliers below are no-ops. Kept so the pattern code that reads
+        //! _peakScale still compiles unchanged.
         virtual void setPeakScale(float scale) { _peakScale = (scale < 1.0f) ? 1.0f : scale; }
 
         //! Rotation Sensation, -1.0 to 1.0, pushed by RotationEngine from the
@@ -125,8 +128,8 @@ class RotationPattern {
         //! slower / longer / less frequent, 0 = the pattern's default behavior.
         virtual void setRotationSensation(float fraction) { _rotationSensationFraction = constrain(fraction, -1.0f, 1.0f); }
 
-        //! Fed by RotationEngine every tick from the stroke axis's telemetry
-        //! (see main.cpp's strokeTelemetryCallback). Most patterns ignore
+        //! Fed by RotationEngine every tick from the stroke axis's
+        //! telemetry (see main.cpp's strokeTelemetryCallback). Most patterns ignore
         //! this entirely - it exists for patterns like ScrewSync that
         //! synchronize rotation to stroke phase. Same idea as StrokeEngine's
         //! Pattern::setSensation(): a parameter every pattern receives,
@@ -211,11 +214,16 @@ class RotationPattern {
     protected:
         char _name[ROT_STRING_LEN];
         float _baseRpm = 0.0f;
-        float _maxRpmCeiling = 0.0f;
+        float _maxRpmCeiling = 0.0f;   // the BURST speed in RPM, see setMaxRpmCeiling()
         float _peakScale = 1.0f;
         float _rotationSensationFraction = 0.0f;
         float _strokeLiveFraction = 0.0f;
         bool _haveLivePosition = false;
+
+        //! Speed a burst phase should spin at: the burst speed, but never below
+        //! the Speed knob (a "burst" that is slower than the normal speed would
+        //! just look like a stall).
+        float _burstTarget() const { return (_maxRpmCeiling > _baseRpm) ? _maxRpmCeiling : _baseRpm; }
 
         //! Rotation Sensation as a time/rate scale: 1.0 at 0, 0.25 at -1, 4.0 at +1.
         //! Multiply a period by this: negative sensation = shorter period (faster).
@@ -332,8 +340,9 @@ class RampingEscalation : public RotationPattern {
 
 /**************************************************************************/
 /*!
-  @brief  Randomized bursts of full base speed against a low resting
-  speed, with randomized burst/rest durations pulled fresh each time a
+  @brief  Randomized bursts at the Burst slider's speed (never below the
+  Speed knob) against a low resting speed (a fraction of the Speed knob),
+  with randomized burst/rest durations pulled fresh each time a
   window elapses. Some bursts also switch direction (merged in from the
   old Random Direction Bursts): the roll happens once per burst-start, so
   a single burst is always one consistent direction. The Reverse checkbox
@@ -390,7 +399,7 @@ class RandomizedBursts : public RotationPattern {
                     _reverse = !_reverse;
                 }
             }
-            _nextMove.rpm = _bursting ? (_baseRpm * _peakScale) : (_baseRpm * _restFraction);
+            _nextMove.rpm = _bursting ? _burstTarget() : (_baseRpm * _restFraction);
             _nextMove.reverse = _reverse;
             _nextMove.skip = false;
             return _nextMove;
@@ -643,10 +652,10 @@ class DepthSurge : public RotationPattern {
 /**************************************************************************/
 /*!
   @brief  Idles at a low resting speed for most of the stroke, then
-  bursts to full base speed only once stroke depth crosses a threshold
-  fraction - a gate rather than Depth Surge's continuous ramp. Direction
-  is the user's manual choice; no motor-safety considerations (speed
-  only, same as Depth Surge).
+  bursts to the Burst slider's speed (never below the Speed knob) only
+  once stroke depth crosses a threshold fraction - a gate rather than
+  Depth Surge's continuous ramp. Direction is the user's manual choice;
+  no motor-safety considerations (speed only, same as Depth Surge).
 
   Same feed requirement as Depth Surge - RotationEngine::setSyncedStrokePosition().
 */
@@ -671,7 +680,7 @@ class ThresholdBurst : public RotationPattern {
                 ? _thresholdFraction + s * (_thresholdFraction - _thresholdMinFraction)
                 : _thresholdFraction + s * (_thresholdMaxFraction - _thresholdFraction);
             bool pastThreshold = _strokePositionFraction >= threshold;
-            _nextMove.rpm = _baseRpm * (pastThreshold ? 1.0f : _restFraction);
+            _nextMove.rpm = pastThreshold ? _burstTarget() : (_baseRpm * _restFraction);
             _nextMove.reverse = _baseDirection;
             _nextMove.skip = false;
             return _nextMove;
@@ -738,7 +747,8 @@ class TempoMatch : public RotationPattern {
   Sanyoudian driver can exceed what the speed knob nominally caps at.
   Keep _snapMultiplier modest (1.2-1.5x) unless you've bench-confirmed
   the driver/motor tolerate brief spikes above the configured ceiling at
-  the speeds you actually run.
+  the speeds you actually run. (Since 2026-11-12 RotationEngine clamps
+  every output to the hard cap, so the spike can never exceed it.)
 */
 /**************************************************************************/
 class SnapReverse : public RotationPattern {
@@ -1069,9 +1079,10 @@ class EscalatingReversal : public RotationPattern {
     2. The instant the stroke axis reaches full depth (a rising-edge
        crossing of _triggerThreshold, same detection as Depth Surge/
        Threshold Burst): opens a BURST WINDOW. Speed jumps to the
-       engine's TRUE maximum (_maxRpmCeiling, fed via setMaxRpmCeiling()
-       - see the base class) - this deliberately IGNORES the Speed knob
-       for the duration of the window, per the design brief. Direction
+       BURST speed (_maxRpmCeiling, fed via setMaxRpmCeiling() - the hard
+       cap times the remote's Burst slider percent, see the base class) -
+       this deliberately IGNORES the Speed knob for the duration of the
+       window, per the design brief. Direction
        then flips repeatedly at even intervals for as long as the
        window is open (see "window length" and "flip interval" below).
     3. The window itself lasts exactly as long as Depth Pulse's own
@@ -1117,7 +1128,7 @@ class EscalatingReversal : public RotationPattern {
   trigger), RotationEngine::setSyncedStrokeSensation() (window length),
   and RotationEngine::setMaxRpm() having been called at least once so
   _maxRpmCeiling (inherited from the base class) is non-zero - otherwise
-  the burst phase will spin at 0 RPM instead of true max. Also depends
+  the burst phase will spin at 0 RPM instead of the burst speed. Also depends
   on the same position-range calibration placeholder as Depth Surge/
   Threshold Burst - see PATTERN-INTEGRATION-NOTES.md section 3.
 */
